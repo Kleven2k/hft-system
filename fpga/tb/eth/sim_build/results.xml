@@ -1,0 +1,9 @@
+<testsuites name="results">
+  <testsuite name="all" package="all">
+    <property name="random_seed" value="1772818004" />
+    <testcase name="test_arp_request" classname="test_eth_stack" file="C:\Users\fredr\Documents\hft-system\fpga\tb\eth\test_eth_stack.py" lineno="201" time="0.6419849395751953" sim_time_ns="896.0" ratio_time="1395.6713697877208" />
+    <testcase name="test_udp_rx" classname="test_eth_stack" file="C:\Users\fredr\Documents\hft-system\fpga\tb\eth\test_eth_stack.py" lineno="242" time="0.0706489086151123" sim_time_ns="2560.0" ratio_time="36235.52083368487" />
+    <testcase name="test_udp_burst" classname="test_eth_stack" file="C:\Users\fredr\Documents\hft-system\fpga\tb\eth\test_eth_stack.py" lineno="293" time="0.7400460243225098" sim_time_ns="21568.0" ratio_time="29144.13332568723" />
+    <testcase name="test_market_burst" classname="test_eth_stack" file="C:\Users\fredr\Documents\hft-system\fpga\tb\eth\test_eth_stack.py" lineno="327" time="2.815124273300171" sim_time_ns="82768.0" ratio_time="29401.18870950271" />
+  </testsuite>
+</testsuites>
