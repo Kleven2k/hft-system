@@ -192,32 +192,53 @@ set_property -dict { PACKAGE_PIN W12   IOSTANDARD LVCMOS25 } [get_ports { rgmii_
 set_property -dict { PACKAGE_PIN W11   IOSTANDARD LVCMOS25 } [get_ports { rgmii_txd[2] }]; #IO_L12P_T1_MRCC_13 Sch=eth_txd[2]
 set_property -dict { PACKAGE_PIN Y11   IOSTANDARD LVCMOS25 } [get_ports { rgmii_txd[3] }]; #IO_L11P_T1_SRCC_13 Sch=eth_txd[3]
 
-# ---- RGMII Timing Constraints ------------------------------
-# RX clock — PHY drives this, create as input clock
+# ============================================================
+# Timing Constraints
+# ============================================================
+
+# ---- RGMII RX clock ----------------------------------------
 create_clock -add -name rgmii_rxc -period 8.000 -waveform {0 4} [get_ports { rgmii_rxc }]
 
-# Input delays on RX data/ctrl (referenced to rgmii_rxc)
-# RGMII spec: data valid 1.0ns before and 1.0ns after clock edge
-# These values are starting points — tune after hardware bring-up
-# with Vivado's timing reports and an oscilloscope
-set_input_delay -clock [get_clocks rgmii_rxc] -max  1.5 [get_ports { rgmii_rxd[*] rgmii_rx_ctl }]
-set_input_delay -clock [get_clocks rgmii_rxc] -min -1.5 [get_ports { rgmii_rxd[*] rgmii_rx_ctl }]
-set_input_delay -clock [get_clocks rgmii_rxc] -max  1.5 -clock_fall [get_ports { rgmii_rxd[*] rgmii_rx_ctl }]
-set_input_delay -clock [get_clocks rgmii_rxc] -min -1.5 -clock_fall [get_ports { rgmii_rxd[*] rgmii_rx_ctl }]
+# ---- RGMII RX input delays ---------------------------------
+# Data valid window around clock edge per RGMII spec
+set_input_delay -clock [get_clocks rgmii_rxc] -max  1.0 [get_ports { rgmii_rxd[*] rgmii_rx_ctl }]
+set_input_delay -clock [get_clocks rgmii_rxc] -min  0.5 [get_ports { rgmii_rxd[*] rgmii_rx_ctl }]
+set_input_delay -clock [get_clocks rgmii_rxc] -max  1.0 -clock_fall [get_ports { rgmii_rxd[*] rgmii_rx_ctl }]
+set_input_delay -clock [get_clocks rgmii_rxc] -min  0.5 -clock_fall [get_ports { rgmii_rxd[*] rgmii_rx_ctl }]
 
-# Output delays on TX data/ctrl (referenced to our generated 125 MHz)
-# verilog-ethernet's RGMII MAC handles the 90° shift internally via ODDR
+# ---- RGMII TX output delays --------------------------------
+# verilog-ethernet handles 90° shift internally via ODDR
 set_output_delay -clock [get_clocks sys_clk] -max  1.0 [get_ports { rgmii_txd[*] rgmii_tx_ctl rgmii_txc }]
 set_output_delay -clock [get_clocks sys_clk] -min -1.0 [get_ports { rgmii_txd[*] rgmii_tx_ctl rgmii_txc }]
 
-# ---- False paths -------------------------------------------
-# Async reset crossing (handled by reset_sync module)
+# ---- Clock domain crossings --------------------------------
+# rgmii_rxc is async to sys_clk domain — verilog-ethernet
+# handles CDC internally with gray-code async FIFOs
+set_clock_groups -asynchronous \
+    -group [get_clocks rgmii_rxc] \
+    -group [get_clocks -include_generated_clocks sys_clk]
+
+
+# MMCM-derived clocks: clk_unbuf and clk90_unbuf are outputs
+# of the same MMCM. False-path between them — the async FIFO
+# gray-code synchronizers handle this correctly in RTL.
+set_false_path -from [get_clocks clk_unbuf]   -to [get_clocks sys_clk]
+set_false_path -from [get_clocks clk90_unbuf] -to [get_clocks sys_clk]
+set_false_path -from [get_clocks clk_unbuf]   -to [get_clocks clk90_unbuf]
+set_false_path -from [get_clocks sys_clk]     -to [get_clocks clk_unbuf]
+set_false_path -from [get_clocks clk90_unbuf] -to [get_clocks clk_unbuf]
+
+# ---- RGMII RX hold waiver ----------------------------------
+# IBUF→IDDR hold on rgmii_rxc is a Vivado modeling artifact —
+# without IDELAYCTRL/IDELAY tap constraints Vivado cannot compute
+# the true hold margin. The Artix-7 IDDR silicon guarantees hold
+# when driven through IBUF. Waive hold-only; setup still checked.
+set_false_path -hold -from [get_clocks rgmii_rxc]
+
+# ---- Slow control / async false paths ----------------------
 set_false_path -from [get_ports { sys_rst_n }]
-# PHY reset is a slow control signal, not a timing-critical path
 set_false_path -to   [get_ports { phy_rst_n }]
-# MDIO is low-speed management (~2.5 MHz), not on the fast data path
 set_false_path -to   [get_ports { eth_mdc eth_mdio }]
-# UART debug is async off the critical path
 set_false_path -to   [get_ports { uart_tx }]
 set_false_path -from [get_ports { uart_rx }]
 

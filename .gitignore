@@ -1,0 +1,36 @@
+# Vivado
+fpga/.Xil/
+fpga/*.jou
+fpga/*.log
+fpga/vivado_*.str
+fpga/ip/**/*.xci
+fpga/runs/
+
+# Bitstreams (large — consider Git LFS or just exclude)
+*.bit
+*.bin
+
+# Research data (can be large tick files)
+research/data/
+
+# Rust
+gui/target/
+
+# Python
+__pycache__/
+*.pyc
+research/.venv/
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Vivado artifacts
+vivado.jou
+vivado.log
+vivado*.backup.jou
+vivado*.backup.log
+clockInfo.txt
+tight_setup_hold_pins.txt
+fpga/runs/

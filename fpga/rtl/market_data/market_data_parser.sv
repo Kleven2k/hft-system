@@ -39,15 +39,20 @@ module market_data_parser
 
     always_ff @(posedge clk) begin
         if (rst) begin
-            state       <= IDLE;
-            byte_count  <= 0;
-            quote_valid <= 0;
-            quote_out   <= '0;
-            timestamp   <= 0;
-            price       <= 0;
-            shares      <= 0;
-            symbol_id   <= 0;
-            is_bid      <= 0;
+            state            <= IDLE;
+            byte_count       <= 0;
+            quote_valid      <= 0;
+            quote_out.valid     <= 0;
+            quote_out.timestamp <= 0;
+            quote_out.price     <= 0;
+            quote_out.shares    <= 0;
+            quote_out.symbol_id <= 0;
+            quote_out.is_bid    <= 0;
+            timestamp        <= 0;
+            price            <= 0;
+            shares           <= 0;
+            symbol_id        <= 0;
+            is_bid           <= 0;
         end
         else begin
             quote_valid <= 0;
