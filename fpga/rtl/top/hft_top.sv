@@ -16,8 +16,8 @@ module hft_top
     output logic        rgmii_tx_ctl,
 
     // PHY management
-    output logic        mdc,
-    inout  wire         mdio,
+    output logic        eth_mdc,
+    inout  wire         eth_mdio,
     output logic        phy_rst_n,
 
     // Debug
@@ -90,23 +90,40 @@ module hft_top
         .gtx_rst            (rst),
         .logic_clk          (clk),
         .logic_rst          (rst),
-        .rgmii_rxc          (rgmii_rxc),
+        // RGMII — note renamed ports vs older verilog-ethernet
+        .rgmii_rx_clk       (rgmii_rxc),
         .rgmii_rxd          (rgmii_rxd),
         .rgmii_rx_ctl       (rgmii_rx_ctl),
-        .rgmii_txc          (rgmii_txc),
+        .rgmii_tx_clk       (rgmii_txc),
         .rgmii_txd          (rgmii_txd),
         .rgmii_tx_ctl       (rgmii_tx_ctl),
+        // AXI-Stream TX
+        .tx_axis_tdata      (mac_tx.tdata),
+        .tx_axis_tkeep      (1'b1),
+        .tx_axis_tvalid     (mac_tx.tvalid),
+        .tx_axis_tready     (mac_tx.tready),
+        .tx_axis_tlast      (mac_tx.tlast),
+        .tx_axis_tuser      (mac_tx.tuser),
+        // AXI-Stream RX
         .rx_axis_tdata      (mac_rx.tdata),
         .rx_axis_tvalid     (mac_rx.tvalid),
         .rx_axis_tready     (mac_rx.tready),
         .rx_axis_tlast      (mac_rx.tlast),
         .rx_axis_tuser      (mac_rx.tuser),
-        .tx_axis_tdata      (mac_tx.tdata),
-        .tx_axis_tvalid     (mac_tx.tvalid),
-        .tx_axis_tready     (mac_tx.tready),
-        .tx_axis_tlast      (mac_tx.tlast),
-        .tx_axis_tuser      (mac_tx.tuser),
-        .ifg_delay          (8'd12),
+        // Config — replaces ifg_delay
+        .cfg_ifg            (8'd12),
+        .cfg_tx_enable      (1'b1),
+        .cfg_rx_enable      (1'b1),
+        // Status — unused
+        .tx_error_underflow (),
+        .tx_fifo_overflow   (),
+        .tx_fifo_bad_frame  (),
+        .tx_fifo_good_frame (),
+        .rx_error_bad_frame (),
+        .rx_error_bad_fcs   (),
+        .rx_fifo_overflow   (),
+        .rx_fifo_bad_frame  (),
+        .rx_fifo_good_frame (),
         .speed              ()
     );
 
@@ -114,12 +131,28 @@ module hft_top
     eth_stack_wrapper eth_stack_inst (
         .clk                (clk),
         .rst                (rst),
-        .mac_rx             (mac_rx),
-        .mac_tx             (mac_tx),
-        .udp_rx             (udp_rx),
+        .mac_rx_tdata       (mac_rx.tdata),
+        .mac_rx_tvalid      (mac_rx.tvalid),
+        .mac_rx_tready      (mac_rx.tready),
+        .mac_rx_tlast       (mac_rx.tlast),
+        .mac_rx_tuser       (mac_rx.tuser),
+        .mac_tx_tdata       (mac_tx.tdata),
+        .mac_tx_tvalid      (mac_tx.tvalid),
+        .mac_tx_tready      (mac_tx.tready),
+        .mac_tx_tlast       (mac_tx.tlast),
+        .mac_tx_tuser       (mac_tx.tuser),
+        .udp_rx_tdata       (udp_rx.tdata),
+        .udp_rx_tvalid      (udp_rx.tvalid),
+        .udp_rx_tready      (udp_rx.tready),
+        .udp_rx_tlast       (udp_rx.tlast),
+        .udp_rx_tuser       (udp_rx.tuser),
         .udp_rx_src_port    (udp_rx_src_port),
         .udp_rx_dst_port    (udp_rx_dst_port),
-        .udp_tx             (udp_tx),
+        .udp_tx_tdata       (udp_tx.tdata),
+        .udp_tx_tvalid      (udp_tx.tvalid),
+        .udp_tx_tready      (udp_tx.tready),
+        .udp_tx_tlast       (udp_tx.tlast),
+        .udp_tx_tuser       (udp_tx.tuser),
         .udp_tx_dst_mac     (udp_tx_dst_mac),
         .udp_tx_dst_ip      (udp_tx_dst_ip),
         .udp_tx_src_port    (udp_tx_src_port),
@@ -186,8 +219,8 @@ module hft_top
     );
 
     // ---- MDIO stub -----------------------------------------
-    assign mdc  = 1'b0;
-    assign mdio = 1'bz;
+    assign eth_mdc  = 1'b0;
+    assign eth_mdio = 1'bz;
 
     // ---- UART loopback (stub) ------------------------------
     assign uart_tx = uart_rx;
