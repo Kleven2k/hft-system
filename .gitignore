@@ -1,36 +1,40 @@
-# Vivado
-fpga/.Xil/
-fpga/*.jou
-fpga/*.log
-fpga/vivado_*.str
-fpga/ip/**/*.xci
+# ── Vivado build outputs ─────────────────────────────────────
 fpga/runs/
-
-# Bitstreams (large — consider Git LFS or just exclude)
+fpga/vivado_logs/
+fpga/ip/**/
+*.jou
+*.log
+*.str
+*.dcp
 *.bit
-*.bin
+*.ltx
+*.rpt
+*.xpr
+*.xsa
+*.mcs
+*.prm
+*.xml
+.Xil/
 
-# Research data (can be large tick files)
-research/data/
+# ── Simulation build caches ──────────────────────────────────
+fpga/tb/**/sim_build*/
+fpga/tb/**/__pycache__/
+*.vvp
+*.vcd
+*.fst
+dump.vcd
+results.xml
 
-# Rust
-gui/target/
-
-# Python
+# ── Python ───────────────────────────────────────────────────
+research/.venv/
 __pycache__/
 *.pyc
-research/.venv/
-.ipynb_checkpoints/
+*.pyo
+.pytest_cache/
 
-# OS
+# ── Editor / OS ──────────────────────────────────────────────
+.vscode/settings.json
+*.swp
+*.swo
 .DS_Store
 Thumbs.db
-
-# Vivado artifacts
-vivado.jou
-vivado.log
-vivado*.backup.jou
-vivado*.backup.log
-clockInfo.txt
-tight_setup_hold_pins.txt
-fpga/runs/
