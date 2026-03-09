@@ -11,6 +11,11 @@
 // Best-price pointers update in O(1) on ADD.
 // On drain (level hits zero), a scan FSM finds the next best.
 //
+// After reset, a clear counter writes 0 to all MAX_LEVELS
+// entries before asserting init_done.  Quote processing is
+// gated on init_done, so the caller must wait MAX_LEVELS
+// cycles after rst de-asserts before sending quotes.
+//
 // Resource estimate (4 instances):
 //   8 × RAMB18 (256×32), ~80 LUTs control logic per instance
 // ============================================================
@@ -40,12 +45,39 @@ module order_book
     localparam int LB = $clog2(MAX_LEVELS);  // 8
 
     // ── BRAM arrays (inferred as RAMB18) ────────────────────
-    // Simple-dual-port: one write port, one read port.
+    // Single write port shared between clear and RMW.
     // Read is registered (1-cycle latency).
     (* ram_style = "block" *)
     logic [31:0] bid_book [0:MAX_LEVELS-1];
     (* ram_style = "block" *)
     logic [31:0] ask_book [0:MAX_LEVELS-1];
+
+    // ── BRAM clear-on-reset ──────────────────────────────────
+    // Writes 0 to every address after each reset.  Ensures
+    // both synthesis (BRAM power-on) and simulation (inter-test)
+    // start from a clean slate.  Uses the same write port as RMW
+    // (they are mutually exclusive via !init_done guard).
+    logic [LB-1:0] clr_addr;
+    logic          init_done;
+
+    always_ff @(posedge clk) begin
+        if (rst) begin
+            clr_addr  <= '0;
+            init_done <= 0;
+        end else if (!init_done) begin
+            bid_book[clr_addr] <= '0;
+            ask_book[clr_addr] <= '0;
+            if (clr_addr == LB'(MAX_LEVELS - 1))
+                init_done <= 1;
+            else
+                clr_addr <= clr_addr + 1;
+        end else if (rmw_valid_1) begin
+            if (rmw_is_bid_1)
+                bid_book[rmw_idx_1] <= rmw_new_qty;
+            else
+                ask_book[rmw_idx_1] <= rmw_new_qty;
+        end
+    end
 
     // ── Best-price pointers ──────────────────────────────────
     logic [LB-1:0] best_bid_idx;
@@ -68,12 +100,15 @@ module order_book
     assign price_idx = quote_in.price[LB-1:0] - price_base[LB-1:0];
 
     // ── BRAM read (registered) ───────────────────────────────
+    // Triggered by the incoming quote (stage 0), one cycle before
+    // rmw_valid_1 (stage 1), so rmw_old_qty is stable when
+    // rmw_new_qty is computed and the BRAM write fires.
     always_ff @(posedge clk) begin
-        if (rmw_valid_1) begin
-            if (rmw_is_bid_1)
-                rmw_old_qty <= bid_book[rmw_idx_1];
+        if (quote_valid && quote_in.valid) begin
+            if (quote_in.is_bid)
+                rmw_old_qty <= bid_book[price_idx];
             else
-                rmw_old_qty <= ask_book[rmw_idx_1];
+                rmw_old_qty <= ask_book[price_idx];
         end
     end
 
@@ -82,7 +117,7 @@ module order_book
         if (rst) begin
             rmw_valid_1  <= 0;
         end else begin
-            rmw_valid_1  <= quote_valid && quote_in.valid;
+            rmw_valid_1  <= init_done && quote_valid && quote_in.valid;
             rmw_idx_1    <= price_idx;
             rmw_is_bid_1 <= quote_in.is_bid;
             rmw_shares_1 <= quote_in.shares;
@@ -90,7 +125,7 @@ module order_book
         end
     end
 
-    // ── RMW stage 1→2: compute + write ──────────────────────
+    // ── RMW stage 1→2: compute (BRAM write is in clear block) ──
     always_comb begin
         case (rmw_op_1)
             OP_ADD:
@@ -109,19 +144,12 @@ module order_book
         rmw_idx_2    <= rmw_idx_1;
         rmw_is_bid_2 <= rmw_is_bid_1;
         rmw_op_2     <= rmw_op_1;
-
-        if (rmw_valid_1) begin
-            if (rmw_is_bid_1)
-                bid_book[rmw_idx_1] <= rmw_new_qty;
-            else
-                ask_book[rmw_idx_1] <= rmw_new_qty;
-        end
     end
 
     // ── Best-pointer update + scan FSM ───────────────────────
     typedef enum logic [1:0] { S_IDLE, S_SCAN_BID, S_SCAN_ASK } scan_t;
     scan_t         scan_state;
-    logic [LB-1:0] scan_idx;
+    (* max_fanout = 4 *) logic [LB-1:0] scan_idx;  // prevent per-bit CE inference on decrement/increment
 
     always_ff @(posedge clk) begin
         if (rst) begin
