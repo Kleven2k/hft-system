@@ -1,6 +1,18 @@
 // ============================================================
 // hft_top.sv — Top-level, Nexys Video (Artix-7)
+//
+// Pipeline (clock domains):
+//
+//   rgmii_rxc domain:
+//     eth_mac → eth_stack_wrapper → market_data_parser
+//                                        │
+//                                   itch_msg_bridge  ← CDC (gray-code FIFO)
+//                                        │
+//   clk domain:                    symbol_router
+//                                  /    |    \   \
+//                              ob[0] ob[1] ob[2] ob[3]
 // ============================================================
+`timescale 1ns/1ps
 module hft_top
     import hft_pkg::*;
 (
@@ -26,22 +38,39 @@ module hft_top
     output logic [3:0]  led
 );
 
-    // ---- Clocks & reset ------------------------------------
-    logic clk;
+    // ── Clocks & reset ──────────────────────────────────────
+    logic clk;        // 125 MHz, MMCM-derived (clk_unbuf domain)
     logic clk90;
     logic clk200;
-    logic rst;
+    logic rst;        // synchronous, active-high, clk domain
+    logic rst_n;      // active-low version for async-reset modules
 
     clk_rst clk_rst_inst (
-        .sys_clk    (sys_clk),
-        .sys_rst_n  (sys_rst_n),
-        .clk        (clk),
-        .clk90      (clk90),
-        .clk200     (clk200),
-        .rst        (rst)
+        .sys_clk   (sys_clk),
+        .sys_rst_n (sys_rst_n),
+        .clk       (clk),
+        .clk90     (clk90),
+        .clk200    (clk200),
+        .rst       (rst)
     );
 
-    // ---- IDELAYCTRL ----------------------------------------
+    assign rst_n = ~rst;
+
+    // rgmii_rxc domain reset: synchronize rst into rgmii_rxc
+    logic rxc_rst_n;
+    logic rxc_rst_sync1, rxc_rst_sync2;
+    always_ff @(posedge rgmii_rxc or posedge rst) begin
+        if (rst) begin
+            rxc_rst_sync1 <= 1'b0;
+            rxc_rst_sync2 <= 1'b0;
+        end else begin
+            rxc_rst_sync1 <= 1'b1;
+            rxc_rst_sync2 <= rxc_rst_sync1;
+        end
+    end
+    assign rxc_rst_n = rxc_rst_sync2;
+
+    // ── IDELAYCTRL ──────────────────────────────────────────
     (* IODELAY_GROUP = "rgmii_idelay" *)
     IDELAYCTRL idelayctrl_inst (
         .REFCLK (clk200),
@@ -49,32 +78,19 @@ module hft_top
         .RDY    ()
     );
 
-    // ---- AXI-Stream interfaces -----------------------------
-    axis_if #(.DATA_W(8)) mac_rx (.clk(clk));
-    axis_if #(.DATA_W(8)) mac_tx (.clk(clk));
-    axis_if #(.DATA_W(8)) udp_rx (.clk(clk));
-    axis_if #(.DATA_W(8)) udp_tx (.clk(clk));
+    // ── AXI-Stream interfaces (rgmii_rxc domain) ────────────
+    axis_if #(.DATA_W(8)) mac_rx (.clk(rgmii_rxc));
+    axis_if #(.DATA_W(8)) mac_tx (.clk(rgmii_rxc));
+    axis_if #(.DATA_W(8)) udp_rx (.clk(rgmii_rxc));
+    axis_if #(.DATA_W(8)) udp_tx (.clk(rgmii_rxc));
 
-    // ---- UDP sideband signals ------------------------------
+    // ── UDP sideband ─────────────────────────────────────────
     logic [15:0] udp_rx_src_port, udp_rx_dst_port;
     logic [47:0] udp_tx_dst_mac;
     logic [31:0] udp_tx_dst_ip;
     logic [15:0] udp_tx_src_port, udp_tx_dst_port, udp_tx_length;
 
-    // ---- Market data pipeline signals ----------------------
-    quote_t      quote_out;
-    logic        quote_valid;
-
-    // ---- 4 order book inputs (one per symbol slot) ---------
-    quote_t      book_in [0:3];
-
-    // ---- Order book outputs --------------------------------
-    logic [31:0] best_bid_price [0:3];
-    logic [31:0] best_ask_price [0:3];
-    logic [31:0] best_bid_size  [0:3];
-    logic [31:0] best_ask_size  [0:3];
-
-    // ---- Ethernet MAC --------------------------------------
+    // ── Ethernet MAC (rgmii_rxc domain) ─────────────────────
     eth_mac_1g_rgmii_fifo #(
         .TARGET             ("XILINX"),
         .IODDR_STYLE        ("IODDR"),
@@ -88,33 +104,28 @@ module hft_top
         .gtx_clk            (clk),
         .gtx_clk90          (clk90),
         .gtx_rst            (rst),
-        .logic_clk          (clk),
-        .logic_rst          (rst),
-        // RGMII — note renamed ports vs older verilog-ethernet
+        .logic_clk          (rgmii_rxc),
+        .logic_rst          (~rxc_rst_n),
         .rgmii_rx_clk       (rgmii_rxc),
         .rgmii_rxd          (rgmii_rxd),
         .rgmii_rx_ctl       (rgmii_rx_ctl),
         .rgmii_tx_clk       (rgmii_txc),
         .rgmii_txd          (rgmii_txd),
         .rgmii_tx_ctl       (rgmii_tx_ctl),
-        // AXI-Stream TX
         .tx_axis_tdata      (mac_tx.tdata),
         .tx_axis_tkeep      (1'b1),
         .tx_axis_tvalid     (mac_tx.tvalid),
         .tx_axis_tready     (mac_tx.tready),
         .tx_axis_tlast      (mac_tx.tlast),
         .tx_axis_tuser      (mac_tx.tuser),
-        // AXI-Stream RX
         .rx_axis_tdata      (mac_rx.tdata),
         .rx_axis_tvalid     (mac_rx.tvalid),
         .rx_axis_tready     (mac_rx.tready),
         .rx_axis_tlast      (mac_rx.tlast),
         .rx_axis_tuser      (mac_rx.tuser),
-        // Config — replaces ifg_delay
         .cfg_ifg            (8'd12),
         .cfg_tx_enable      (1'b1),
         .cfg_rx_enable      (1'b1),
-        // Status — unused
         .tx_error_underflow (),
         .tx_fifo_overflow   (),
         .tx_fifo_bad_frame  (),
@@ -127,110 +138,180 @@ module hft_top
         .speed              ()
     );
 
-    // ---- Ethernet stack (ARP/IP/UDP) -----------------------
+    // ── Ethernet stack ARP/IP/UDP (rgmii_rxc domain) ────────
     eth_stack_wrapper eth_stack_inst (
-        .clk                (clk),
-        .rst                (rst),
-        .mac_rx_tdata       (mac_rx.tdata),
-        .mac_rx_tvalid      (mac_rx.tvalid),
-        .mac_rx_tready      (mac_rx.tready),
-        .mac_rx_tlast       (mac_rx.tlast),
-        .mac_rx_tuser       (mac_rx.tuser),
-        .mac_tx_tdata       (mac_tx.tdata),
-        .mac_tx_tvalid      (mac_tx.tvalid),
-        .mac_tx_tready      (mac_tx.tready),
-        .mac_tx_tlast       (mac_tx.tlast),
-        .mac_tx_tuser       (mac_tx.tuser),
-        .udp_rx_tdata       (udp_rx.tdata),
-        .udp_rx_tvalid      (udp_rx.tvalid),
-        .udp_rx_tready      (udp_rx.tready),
-        .udp_rx_tlast       (udp_rx.tlast),
-        .udp_rx_tuser       (udp_rx.tuser),
-        .udp_rx_src_port    (udp_rx_src_port),
-        .udp_rx_dst_port    (udp_rx_dst_port),
-        .udp_tx_tdata       (udp_tx.tdata),
-        .udp_tx_tvalid      (udp_tx.tvalid),
-        .udp_tx_tready      (udp_tx.tready),
-        .udp_tx_tlast       (udp_tx.tlast),
-        .udp_tx_tuser       (udp_tx.tuser),
-        .udp_tx_dst_mac     (udp_tx_dst_mac),
-        .udp_tx_dst_ip      (udp_tx_dst_ip),
-        .udp_tx_src_port    (udp_tx_src_port),
-        .udp_tx_dst_port    (udp_tx_dst_port),
-        .udp_tx_length      (udp_tx_length)
+        .clk             (rgmii_rxc),
+        .rst             (~rxc_rst_n),
+        .mac_rx_tdata    (mac_rx.tdata),
+        .mac_rx_tvalid   (mac_rx.tvalid),
+        .mac_rx_tready   (mac_rx.tready),
+        .mac_rx_tlast    (mac_rx.tlast),
+        .mac_rx_tuser    (mac_rx.tuser),
+        .mac_tx_tdata    (mac_tx.tdata),
+        .mac_tx_tvalid   (mac_tx.tvalid),
+        .mac_tx_tready   (mac_tx.tready),
+        .mac_tx_tlast    (mac_tx.tlast),
+        .mac_tx_tuser    (mac_tx.tuser),
+        .udp_rx_tdata    (udp_rx.tdata),
+        .udp_rx_tvalid   (udp_rx.tvalid),
+        .udp_rx_tready   (udp_rx.tready),
+        .udp_rx_tlast    (udp_rx.tlast),
+        .udp_rx_tuser    (udp_rx.tuser),
+        .udp_rx_src_port (udp_rx_src_port),
+        .udp_rx_dst_port (udp_rx_dst_port),
+        .udp_tx_tdata    (udp_tx.tdata),
+        .udp_tx_tvalid   (udp_tx.tvalid),
+        .udp_tx_tready   (udp_tx.tready),
+        .udp_tx_tlast    (udp_tx.tlast),
+        .udp_tx_tuser    (udp_tx.tuser),
+        .udp_tx_dst_mac  (udp_tx_dst_mac),
+        .udp_tx_dst_ip   (udp_tx_dst_ip),
+        .udp_tx_src_port (udp_tx_src_port),
+        .udp_tx_dst_port (udp_tx_dst_port),
+        .udp_tx_length   (udp_tx_length)
     );
 
-    // ---- Market data parser --------------------------------
-    // Consumes UDP RX byte stream, emits quote_t structs
+    // ── Market data parser (rgmii_rxc domain) ───────────────
+    // Decodes UDP byte stream → quote_t with op=OP_ADD
+    quote_t w_quote;
+    logic   w_quote_valid;
+
     market_data_parser mkt_parser_inst (
-        .clk         (clk),
-        .rst         (rst),
-        .udp_rx      (udp_rx),       // axis_if.slave — byte stream in
-        .quote_out   (quote_out),    // quote_t — decoded quote
-        .quote_valid (quote_valid)   // one-cycle pulse
+        .clk         (rgmii_rxc),
+        .rst         (~rxc_rst_n),
+        .udp_rx      (udp_rx),
+        .quote_out   (w_quote),
+        .quote_valid (w_quote_valid)
     );
 
-    // ---- Symbol router -------------------------------------
-    // Routes quote to one of 4 order book slots by symbol_id
-    symbol_router #(
-        .N_BOOKS (4)
-    ) sym_router_inst (
-        .quote_in (quote_out),
+    // ── CDC bridge (rgmii_rxc → clk) ────────────────────────
+    quote_t r_quote;
+    logic   r_quote_valid;
+    logic   w_drop;
+    logic [15:0] w_drop_count;
+
+    itch_msg_bridge cdc_bridge_inst (
+        .wclk          (rgmii_rxc),
+        .wrst_n        (rxc_rst_n),
+        .w_quote       (w_quote),
+        .w_quote_valid (w_quote_valid),
+        .w_drop        (w_drop),
+        .w_drop_count  (w_drop_count),
+        .rclk          (clk),
+        .rrst_n        (rst_n),
+        .r_quote       (r_quote),
+        .r_quote_valid (r_quote_valid),
+        .fifo_empty    (),
+        .fifo_full_rclk()
+    );
+
+    // ── Symbol router (clk domain) ──────────────────────────
+    // Routes r_quote to one of 4 order book slots by symbol_id
+    quote_t book_in [0:3];
+
+    symbol_router #(.N_BOOKS(4)) sym_router_inst (
+        .quote_in (r_quote),
         .book     (book_in)
     );
 
-    // ---- Order books (4 symbols) ---------------------------
+    // ── Price base table (clk domain) ───────────────────────
+    logic [31:0] price_base [0:3];
+
+    price_base_table #(
+        .N_BOOKS(4),
+        .BASE0  (100),
+        .BASE1  (100),
+        .BASE2  (100),
+        .BASE3  (100)
+    ) price_base_inst (
+        .clk       (clk),
+        .rst       (rst),
+        .wr_en     (1'b0),
+        .wr_slot   ('0),
+        .wr_base   ('0),
+        .price_base(price_base)
+    );
+
+    // ── Order books × 4 (clk domain) ────────────────────────
+    logic [31:0] best_bid_price [0:3];
+    logic [31:0] best_ask_price [0:3];
+    logic [31:0] best_bid_qty   [0:3];
+    logic [31:0] best_ask_qty   [0:3];
+    logic [31:0] spread         [0:3];
+    logic [31:0] mid_price      [0:3];
+    logic        bid_valid      [0:3];
+    logic        ask_valid      [0:3];
+
     generate
         for (genvar i = 0; i < 4; i++) begin : gen_order_books
-            order_book #(
-                .MAX_PRICE (1024)
-            ) order_book_inst (
+            order_book #(.MAX_LEVELS(256)) ob_inst (
                 .clk            (clk),
                 .rst            (rst),
                 .quote_in       (book_in[i]),
+                .quote_valid    (r_quote_valid && book_in[i].valid),
+                .price_base     (price_base[i]),
                 .best_bid_price (best_bid_price[i]),
                 .best_ask_price (best_ask_price[i]),
-                .best_bid_size  (best_bid_size[i]),
-                .best_ask_size  (best_ask_size[i])
+                .best_bid_qty   (best_bid_qty[i]),
+                .best_ask_qty   (best_ask_qty[i]),
+                .spread         (spread[i]),
+                .mid_price      (mid_price[i]),
+                .bid_valid      (bid_valid[i]),
+                .ask_valid      (ask_valid[i])
             );
         end
     endgenerate
 
-    // ---- UDP TX tie-off (stub — Phase 5 order engine) ------
-    // When order engine is added it will drive these signals.
-    // For now hold TX idle so udp_complete doesn't hang.
-    assign udp_tx.tdata  = 8'h00;
-    assign udp_tx.tvalid = 1'b0;
-    assign udp_tx.tlast  = 1'b0;
-    assign udp_tx.tuser  = 1'b0;
-    assign udp_tx_dst_mac    = '0;
-    assign udp_tx_dst_ip     = '0;
-    assign udp_tx_src_port   = PORT_OUCH;
-    assign udp_tx_dst_port   = '0;
-    assign udp_tx_length     = '0;
-
-    // ---- PHY reset -----------------------------------------
-    phy_reset_ctrl #(
-        .HOLD_CYCLES (PHY_RESET_CYCLES)
-    ) phy_rst_inst (
-        .clk        (clk),
-        .rst        (rst),
-        .phy_rst_n  (phy_rst_n)
+    // ── Order engine: strategy + CDC + OUCH encoder ─────────
+    order_engine #(
+        .N_BOOKS      (4),
+        .SPREAD_MAX   (20000),
+        .ORDER_QTY    (100),
+        .COOLDOWN_CYC (12_500_000)
+    ) order_engine_inst (
+        .clk           (clk),
+        .rst           (rst),
+        .rst_n         (rst_n),
+        .best_bid_price(best_bid_price),
+        .best_ask_price(best_ask_price),
+        .spread        (spread),
+        .bid_valid     (bid_valid),
+        .ask_valid     (ask_valid),
+        .enc_clk       (rgmii_rxc),
+        .enc_rst_n     (rxc_rst_n),
+        .udp_tx_tdata  (udp_tx.tdata),
+        .udp_tx_tvalid (udp_tx.tvalid),
+        .udp_tx_tready (udp_tx.tready),
+        .udp_tx_tlast  (udp_tx.tlast),
+        .udp_tx_tuser  (udp_tx.tuser),
+        .udp_tx_dst_mac  (udp_tx_dst_mac),
+        .udp_tx_dst_ip   (udp_tx_dst_ip),
+        .udp_tx_src_port (udp_tx_src_port),
+        .udp_tx_dst_port (udp_tx_dst_port),
+        .udp_tx_length   (udp_tx_length),
+        .drop_count      ()
     );
 
-    // ---- MDIO stub -----------------------------------------
+    // ── PHY reset ───────────────────────────────────────────
+    phy_reset_ctrl #(.HOLD_CYCLES(PHY_RESET_CYCLES)) phy_rst_inst (
+        .clk       (clk),
+        .rst       (rst),
+        .phy_rst_n (phy_rst_n)
+    );
+
+    // ── MDIO stub ───────────────────────────────────────────
     assign eth_mdc  = 1'b0;
     assign eth_mdio = 1'bz;
 
-    // ---- UART loopback (stub) ------------------------------
+    // ── UART loopback stub ──────────────────────────────────
     assign uart_tx = uart_rx;
 
-    // ---- Debug LEDs ----------------------------------------
+    // ── Debug LEDs (clk domain) ─────────────────────────────
     always_ff @(posedge clk) begin
-        led[0] <= ~rst;              // on = running
-        led[1] <= mac_rx.tvalid;    // RX activity
-        led[2] <= quote_valid;      // market data being parsed
-        led[3] <= mac_tx.tvalid;    // TX activity
+        led[0] <= ~rst;                      // on = running
+        led[1] <= mac_rx.tvalid;            // RX activity  (rgmii_rxc → metastable, ok for LED)
+        led[2] <= r_quote_valid;            // quotes crossing CDC
+        led[3] <= bid_valid[0] | bid_valid[1] | bid_valid[2] | bid_valid[3];
     end
 
 endmodule

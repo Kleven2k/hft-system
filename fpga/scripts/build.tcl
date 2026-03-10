@@ -35,6 +35,8 @@ read_verilog -sv [glob $RTL_DIR/core/*.sv]
 read_verilog -sv [glob $RTL_DIR/eth/*.sv]
 read_verilog -sv [glob $RTL_DIR/market_data/*.sv]
 read_verilog -sv [glob $RTL_DIR/order_book/*.sv]
+read_verilog -sv [glob $RTL_DIR/strategy/*.sv]
+read_verilog -sv [glob $RTL_DIR/order_entry/*.sv]
 read_verilog -sv [glob $RTL_DIR/top/*.sv]
 
 # ---- Read verilog-ethernet (explicit — only what we use) ---
