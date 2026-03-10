@@ -92,9 +92,8 @@ module order_book
     logic          rmw_is_bid_1, rmw_is_bid_2;
     logic [31:0]   rmw_shares_1;
     op_t           rmw_op_1,     rmw_op_2;
-    logic [31:0]   rmw_old_qty;  // BRAM read result (1-cycle latency)
-    logic [31:0]   rmw_new_qty;
-    logic          rmw_drained;  // new_qty == 0
+    logic [31:0]   rmw_old_qty;  // BRAM read result (stage 0→1)
+    logic          rmw_drained;  // registered (stage 1→2): breaks 14-level path to scan_idx
 
     logic [LB-1:0] price_idx;
     assign price_idx = quote_in.price[LB-1:0] - price_base[LB-1:0];
@@ -125,7 +124,15 @@ module order_book
         end
     end
 
-    // ── RMW stage 1→2: compute (BRAM write is in clear block) ──
+    // ── RMW stage 1→2: compute + pipeline registers ─────────
+    // rmw_new_qty is combinational from rmw_old_qty (used for BRAM write
+    // at stage 1 — must NOT be delayed or back-to-back quotes lose data).
+    //
+    // rmw_drained is registered into stage 2 to break the critical path:
+    //   rmw_old_qty → arithmetic (CARRY4×7) → zero-check → scan_idx CE
+    // was 14 logic levels (8.891 ns).  With rmw_drained registered the
+    // path to scan_idx shrinks to ~3 levels (rmw_drained_reg → MUX → D).
+    logic [31:0] rmw_new_qty;
     always_comb begin
         case (rmw_op_1)
             OP_ADD:
@@ -137,13 +144,13 @@ module order_book
                 rmw_new_qty = rmw_old_qty;
         endcase
     end
-    assign rmw_drained = (rmw_new_qty == 0);
 
     always_ff @(posedge clk) begin
         rmw_valid_2  <= rmw_valid_1;
         rmw_idx_2    <= rmw_idx_1;
         rmw_is_bid_2 <= rmw_is_bid_1;
         rmw_op_2     <= rmw_op_1;
+        rmw_drained  <= (rmw_new_qty == '0);   // registered at stage 1→2
     end
 
     // ── Best-pointer update + scan FSM ───────────────────────
