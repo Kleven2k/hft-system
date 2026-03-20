@@ -2,7 +2,7 @@
 
 venv activation
 
-\research\.venv\Scripts\activate
+.\research\.venv\Scripts\activate
 
 
 Vivado build.tcl

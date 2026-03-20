@@ -156,7 +156,7 @@ module order_book
     // ── Best-pointer update + scan FSM ───────────────────────
     typedef enum logic [1:0] { S_IDLE, S_SCAN_BID, S_SCAN_ASK } scan_t;
     scan_t         scan_state;
-    (* max_fanout = 4 *) logic [LB-1:0] scan_idx;  // prevent per-bit CE inference on decrement/increment
+    logic [LB-1:0] scan_idx;
 
     always_ff @(posedge clk) begin
         if (rst) begin
@@ -224,13 +224,25 @@ module order_book
         end
     end
 
+    // ── Registered output quantity reads ────────────────────
+    // Synchronous reads allow proper BRAM inference for bid_book/ask_book.
+    // Async reads would force 256:1 LUT MUXes, creating ~128 loads/bit on
+    // best_bid_idx/best_ask_idx and preventing BRAM inference for scan reads.
+    logic [31:0] best_bid_qty_reg;
+    logic [31:0] best_ask_qty_reg;
+
+    always_ff @(posedge clk) begin
+        best_bid_qty_reg <= bid_book[best_bid_idx];
+        best_ask_qty_reg <= ask_book[best_ask_idx];
+    end
+
     // ── Output assignments ───────────────────────────────────
     assign best_bid_price = bid_valid
                             ? price_base + {24'b0, best_bid_idx} : '0;
     assign best_ask_price = ask_valid
                             ? price_base + {24'b0, best_ask_idx} : '0;
-    assign best_bid_qty   = bid_valid ? bid_book[best_bid_idx] : '0;
-    assign best_ask_qty   = ask_valid ? ask_book[best_ask_idx] : '0;
+    assign best_bid_qty   = bid_valid ? best_bid_qty_reg : '0;
+    assign best_ask_qty   = ask_valid ? best_ask_qty_reg : '0;
     assign spread         = (bid_valid && ask_valid
                              && best_ask_price > best_bid_price)
                             ? best_ask_price - best_bid_price : '0;

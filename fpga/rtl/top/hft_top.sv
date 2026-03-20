@@ -180,6 +180,7 @@ module hft_top
         .clk         (rgmii_rxc),
         .rst         (~rxc_rst_n),
         .udp_rx      (udp_rx),
+        .rx_dst_port (udp_rx_dst_port),
         .quote_out   (w_quote),
         .quote_valid (w_quote_valid)
     );
@@ -214,21 +215,38 @@ module hft_top
         .book     (book_in)
     );
 
+    // ── UART RX config (clk domain) ─────────────────────────
+    logic        uart_wr_en;
+    logic [1:0]  uart_wr_slot;
+    logic [31:0] uart_wr_base;
+
+    logic kill_switch;
+
+    uart_rx_config #(.N_BOOKS(4)) uart_cfg_inst (
+        .clk        (clk),
+        .rst        (rst),
+        .uart_rx    (uart_rx),
+        .wr_en      (uart_wr_en),
+        .wr_slot    (uart_wr_slot),
+        .wr_base    (uart_wr_base),
+        .kill_switch(kill_switch)
+    );
+
     // ── Price base table (clk domain) ───────────────────────
     logic [31:0] price_base [0:3];
 
     price_base_table #(
         .N_BOOKS(4),
-        .BASE0  (100),
-        .BASE1  (100),
-        .BASE2  (100),
-        .BASE3  (100)
+        .BASE0  (1_000_000),   // slot 0: $100.00
+        .BASE1  (2_000_000),   // slot 1: $200.00
+        .BASE2  (  500_000),   // slot 2:  $50.00
+        .BASE3  (  150_000)    // slot 3:  $15.00
     ) price_base_inst (
         .clk       (clk),
         .rst       (rst),
-        .wr_en     (1'b0),
-        .wr_slot   ('0),
-        .wr_base   ('0),
+        .wr_en     (uart_wr_en),
+        .wr_slot   (uart_wr_slot),
+        .wr_base   (uart_wr_base),
         .price_base(price_base)
     );
 
@@ -262,34 +280,64 @@ module hft_top
         end
     endgenerate
 
+    // ── OUCH ACK receiver (rgmii_rxc domain) ────────────────
+    logic        ack_raw_valid;
+    logic [63:0] ack_raw_order_id;
+    logic [7:0]  ack_raw_status;
+    logic [31:0] ack_raw_fill_qty;
+
+    ouch_ack_receiver ack_rx_inst (
+        .clk          (rgmii_rxc),
+        .rst          (~rxc_rst_n),
+        .rx_tdata     (udp_rx.tdata),
+        .rx_tvalid    (udp_rx.tvalid),
+        .rx_tlast     (udp_rx.tlast),
+        .rx_dst_port  (udp_rx_dst_port),
+        .ack_valid    (ack_raw_valid),
+        .ack_order_id (ack_raw_order_id),
+        .ack_status   (ack_raw_status),
+        .ack_fill_qty (ack_raw_fill_qty)
+    );
+
     // ── Order engine: strategy + CDC + OUCH encoder ─────────
     order_engine #(
-        .N_BOOKS      (4),
-        .SPREAD_MAX   (20000),
-        .ORDER_QTY    (100),
-        .COOLDOWN_CYC (12_500_000)
+        .N_BOOKS       (4),
+        .SPREAD_MAX    (20000),
+        .ORDER_QTY     (100),
+        .MAX_POSITION  (1000),
+        .COOLDOWN_CYC  (12_500_000),
+        .SKEW_SHIFT    (3),            // inv_skew = position>>3 (~12 ticks at pos=100)
+        .FAT_FINGER_BPS(500),
+        .MAX_BURST     (5),
+        .REFILL_PERIOD (12_500_000)
     ) order_engine_inst (
-        .clk           (clk),
-        .rst           (rst),
-        .rst_n         (rst_n),
-        .best_bid_price(best_bid_price),
-        .best_ask_price(best_ask_price),
-        .spread        (spread),
-        .bid_valid     (bid_valid),
-        .ask_valid     (ask_valid),
-        .enc_clk       (rgmii_rxc),
-        .enc_rst_n     (rxc_rst_n),
-        .udp_tx_tdata  (udp_tx.tdata),
-        .udp_tx_tvalid (udp_tx.tvalid),
-        .udp_tx_tready (udp_tx.tready),
-        .udp_tx_tlast  (udp_tx.tlast),
-        .udp_tx_tuser  (udp_tx.tuser),
-        .udp_tx_dst_mac  (udp_tx_dst_mac),
-        .udp_tx_dst_ip   (udp_tx_dst_ip),
-        .udp_tx_src_port (udp_tx_src_port),
-        .udp_tx_dst_port (udp_tx_dst_port),
-        .udp_tx_length   (udp_tx_length),
-        .drop_count      ()
+        .clk              (clk),
+        .rst              (rst),
+        .rst_n            (rst_n),
+        .best_bid_price   (best_bid_price),
+        .best_ask_price   (best_ask_price),
+        .mid_price        (mid_price),
+        .spread           (spread),
+        .bid_valid        (bid_valid),
+        .ask_valid        (ask_valid),
+        .kill_switch      (kill_switch),
+        .enc_clk          (rgmii_rxc),
+        .enc_rst_n        (rxc_rst_n),
+        .udp_tx_tdata     (udp_tx.tdata),
+        .udp_tx_tvalid    (udp_tx.tvalid),
+        .udp_tx_tready    (udp_tx.tready),
+        .udp_tx_tlast     (udp_tx.tlast),
+        .udp_tx_tuser     (udp_tx.tuser),
+        .udp_tx_dst_mac   (udp_tx_dst_mac),
+        .udp_tx_dst_ip    (udp_tx_dst_ip),
+        .udp_tx_src_port  (udp_tx_src_port),
+        .udp_tx_dst_port  (udp_tx_dst_port),
+        .udp_tx_length    (udp_tx_length),
+        .ack_raw_valid    (ack_raw_valid),
+        .ack_raw_order_id (ack_raw_order_id),
+        .ack_raw_status   (ack_raw_status),
+        .ack_raw_fill_qty (ack_raw_fill_qty),
+        .drop_count       ()
     );
 
     // ── PHY reset ───────────────────────────────────────────
@@ -303,13 +351,13 @@ module hft_top
     assign eth_mdc  = 1'b0;
     assign eth_mdio = 1'bz;
 
-    // ── UART loopback stub ──────────────────────────────────
+    // ── UART TX (loopback echo for host feedback) ───────────
     assign uart_tx = uart_rx;
 
     // ── Debug LEDs (clk domain) ─────────────────────────────
     always_ff @(posedge clk) begin
         led[0] <= ~rst;                      // on = running
-        led[1] <= mac_rx.tvalid;            // RX activity  (rgmii_rxc → metastable, ok for LED)
+        led[1] <= mac_rx.tvalid;            // RX activity
         led[2] <= r_quote_valid;            // quotes crossing CDC
         led[3] <= bid_valid[0] | bid_valid[1] | bid_valid[2] | bid_valid[3];
     end

@@ -1,6 +1,12 @@
 # ============================================================
-# build.tcl — Vivado non-project batch build script
-# Usage: vivado -mode tcl -source fpga/scripts/build.tcl
+# build.tcl — Vivado synth + place (Stage 1 of 2)
+#
+# Called by build.sh with a pre-created RUN_DIR argument so
+# both stages share the same output directory.
+#
+# Usage (via wrapper):  bash fpga/scripts/build.sh
+# Usage (direct):       vivado -mode tcl -source fpga/scripts/build.tcl \
+#                               -tclargs <run_dir>
 # ============================================================
 
 # ---- Configuration -----------------------------------------
@@ -19,9 +25,12 @@ set VE          "$TP_DIR/rtl"
 set AX          "$TP_DIR/lib/axis/rtl"
 
 # ---- Timestamped output directory -------------------------
-set TS          [clock format [clock seconds] -format "%Y%m%d_%H%M%S"]
-set RUN_DIR     "$FPGA_DIR/runs/build_$TS"
+set TS      [clock format [clock seconds] -format "%Y%m%d_%H%M%S"]
+set RUN_DIR "$FPGA_DIR/runs/build_$TS"
 file mkdir $RUN_DIR
+
+# Limit parallel threads to reduce peak memory
+set_param general.maxThreads 1
 
 puts "============================================================"
 puts " HFT-SYSTEM BUILD"
@@ -32,7 +41,7 @@ puts "============================================================"
 
 # ---- Read RTL ----------------------------------------------
 read_verilog -sv [glob $RTL_DIR/core/*.sv]
-read_verilog -sv [glob $RTL_DIR/eth/*.sv]
+read_verilog -sv [glob $RTL_DIR/eth/*.sv]   ;# includes telemetry_tx.sv
 read_verilog -sv [glob $RTL_DIR/market_data/*.sv]
 read_verilog -sv [glob $RTL_DIR/order_book/*.sv]
 read_verilog -sv [glob $RTL_DIR/strategy/*.sv]
@@ -119,16 +128,19 @@ report_timing_summary -file "$RUN_DIR/timing_place.rpt"
 
 puts "\n--- Route ---"
 route_design
+
+puts "\n--- Post-route physical optimization ---"
+phys_opt_design -directive AggressiveExplore
+
+puts "\n--- Saving checkpoint ---"
 write_checkpoint -force "$RUN_DIR/post_route.dcp"
 
-# ---- Reports -----------------------------------------------
 puts "\n--- Reports ---"
-report_timing_summary  -file "$RUN_DIR/timing.rpt"
-report_utilization     -file "$RUN_DIR/util.rpt"
-report_power           -file "$RUN_DIR/power.rpt"
-report_drc             -file "$RUN_DIR/drc.rpt"
+report_timing_summary -file "$RUN_DIR/timing.rpt"
+report_utilization    -file "$RUN_DIR/util.rpt"
+report_power          -file "$RUN_DIR/power.rpt"
+report_drc            -file "$RUN_DIR/drc.rpt"
 
-# ---- Bitstream ---------------------------------------------
 puts "\n--- Bitstream ---"
 write_bitstream -force "$RUN_DIR/hft_top.bit"
 

@@ -159,10 +159,11 @@ set_property -dict { PACKAGE_PIN G4  IOSTANDARD LVCMOS15 } [get_ports { sys_rst_
 
 ## UART
 # ---- UART (USB-UART bridge) --------------------------------
-# Note: Digilent uses uart_rx_out / uart_tx_in naming on schematic.
-# We alias these to uart_rx / uart_tx in RTL for clarity.
-set_property -dict { PACKAGE_PIN AA19  IOSTANDARD LVCMOS33 } [get_ports { uart_rx }]; #IO_L15P_T2_DQS_RDWR_B_14 Sch=uart_rx_out
-set_property -dict { PACKAGE_PIN V18   IOSTANDARD LVCMOS33 } [get_ports { uart_tx }]; #IO_L14P_T2_SRCC_14 Sch=uart_tx_in
+# Official Digilent Nexys Video master XDC naming:
+#   uart_txd_in  (AA19) = FT2232 RXD input  = FPGA TX output
+#   uart_rxd_out (V18)  = FT2232 TXD output = FPGA RX input
+set_property -dict { PACKAGE_PIN V18   IOSTANDARD LVCMOS33 } [get_ports { uart_rx }]; #IO_L14P_T2_SRCC_14      Sch=uart_rxd_out
+set_property -dict { PACKAGE_PIN AA19  IOSTANDARD LVCMOS33 } [get_ports { uart_tx }]; #IO_L15P_T2_DQS_RDWR_B_14 Sch=uart_txd_in
 
 
 ## Ethernet
@@ -241,6 +242,20 @@ set_false_path -to   [get_ports { phy_rst_n }]
 set_false_path -to   [get_ports { eth_mdc eth_mdio }]
 set_false_path -to   [get_ports { uart_tx }]
 set_false_path -from [get_ports { uart_rx }]
+
+# ---- Multicycle path: BRAM RMW write path ------------------
+# rmw_old_qty → rmw_new_qty → BRAM D is the critical path at
+# WNS +0.112 ns. The BRAM write can safely use 2 cycles because
+# quotes arrive at ~1 packet per UDP frame (~10 µs minimum gap),
+# far slower than the 2-cycle window (16 ns @ 125 MHz).
+set_multicycle_path -setup 2 -from [get_cells -hier -filter {NAME =~ *rmw_old_qty_reg*}] \
+    -to [get_cells -hier -filter {NAME =~ *gen_order_books*bid_book*}]
+set_multicycle_path -setup 2 -from [get_cells -hier -filter {NAME =~ *rmw_old_qty_reg*}] \
+    -to [get_cells -hier -filter {NAME =~ *gen_order_books*ask_book*}]
+set_multicycle_path -hold  1 -from [get_cells -hier -filter {NAME =~ *rmw_old_qty_reg*}] \
+    -to [get_cells -hier -filter {NAME =~ *gen_order_books*bid_book*}]
+set_multicycle_path -hold  1 -from [get_cells -hier -filter {NAME =~ *rmw_old_qty_reg*}] \
+    -to [get_cells -hier -filter {NAME =~ *gen_order_books*ask_book*}]
 
 ## Fan PWM
 #set_property -dict { PACKAGE_PIN U15   IOSTANDARD LVCMOS25 } [get_ports { fan_pwm }]; #IO_L14P_T2_SRCC_13 Sch=fan_pwm

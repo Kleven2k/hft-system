@@ -89,7 +89,7 @@ wire udp_tx_hdr_ready;
 wire udp_rx_hdr_valid;
 wire udp_rx_hdr_ready;
 
-assign udp_tx_hdr_valid = udp_tx_tvalid && udp_tx_tlast;
+assign udp_tx_hdr_valid = udp_tx_tvalid;
 assign udp_rx_hdr_ready = 1'b1;
 
 ////////////////////////////////////////////////////////////////////////
