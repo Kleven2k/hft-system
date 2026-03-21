@@ -1,0 +1,17 @@
+[Unit]
+Description=HFT tick data collector (Binance WebSocket)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/hft-system
+ExecStart=/home/pi/hft-system/.venv/bin/python research/collectors/data_collector.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
