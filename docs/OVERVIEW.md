@@ -1,9 +1,8 @@
 # HFT System — Project Overview
 
-> Last updated: 2026-03-21
+> Last updated: 2026-03-22
 > Hardware: Digilent Nexys Video (Xilinx Artix-7 XC7A200T), 125 MHz system clock
-> Goal: Learn networking, market microstructure, and FPGA engineering through a real HFT system.
-> Live trading is not required — validated simulation and realistic backtests are the target.
+> Goal: Build a real HFT system — FPGA market-making pipeline, validated strategies, path to live trading.
 
 ---
 
@@ -59,24 +58,47 @@ Ethernet RX
 
 | File | Purpose |
 |------|---------|
-| `software/feed_bridge.py` | Bridges Binance WebSocket → FPGA market data feed. Sends UART price_base + quote_offset config at startup. Holds kill_switch ON until all 4 symbols are initialised. |
+| `software/feed_bridge.py` | Bridges Binance WebSocket → FPGA market data feed. Sends UART price_base + quote_offset config at startup. |
 | `software/ack_simulator.py` | Simple ACK simulator — always fills every order. Useful for smoke tests. |
-| `software/ack_simulator_realistic.py` | Realistic simulator — connects to live Binance book, only fills if price crosses. Tracks P&L per symbol. |
 | `software/monitor.py` | Reads UDP telemetry from FPGA: P&L, fill counts, position, order counts per slot. |
 | `software/set_price_base.py` | UART tool: sends price_base calibration for a given slot. |
 | `software/set_risk.py` | UART tool: configures fat-finger limit, kill switch. |
 
-### 1.3 Research Tools
+### 1.3 Research & Backtesting
 
-| File / Folder | Purpose |
-|---------------|---------|
-| `research/collectors/data_collector.py` | Collects live Binance tick data to Parquet (designed to run on Raspberry Pi 24/7) |
-| `research/backtest/backtest.py` | Backtests market-making strategy against collected tick data. Sweeps quote_offset parameter. |
-| `research/monitors/dex_monitor.py` | Monitors price spread between Binance CEX and Trader Joe V1 DEX on Avalanche. Logs to CSV. |
-| `research/collectors/download_binance_data.py` | Downloads historical Binance klines for offline analysis. |
-| `research/market_engine/` | Rust-based market simulator (matching engine + replay harness). Produces fills.csv/market.csv. |
-| `research/lob/` | Limit order book research: collects top-of-book snapshots, builds Parquet datasets. |
-| `docs/specs/NQTVITCHspecification.pdf` | Official NASDAQ TotalView-ITCH 5.0 specification (already on hand). |
+#### Data Collection
+| File | Purpose |
+|------|---------|
+| `research/collectors/data_collector.py` | Streams Binance WebSocket tick data to CSV — runs 24/7 on Raspberry Pi as systemd service |
+| `research/collectors/alpaca_history.py` | Downloads up to 2 years of minute bars from Alpaca (AAPL/MSFT/AMD/NVDA/QQQ) |
+| `research/collectors/alpaca_collector.py` | Live Alpaca WebSocket collector (requires live account) |
+| `research/monitors/dex_monitor.py` | Monitors DEX/CEX spread between Binance and Trader Joe V1 on Avalanche |
+
+#### NASDAQ ITCH Tools (Rust)
+| File | Purpose |
+|------|---------|
+| `research/nasdaq/itch_rs/` | Rust ITCH 5.0 parser + order book reconstructor. Parses 423M messages in ~2 min (vs 10+ min in Python) |
+| `research/nasdaq/itch_parser.py` | Python ITCH 5.0 parser (reference implementation) |
+| `research/nasdaq/order_book.py` | Python order book reconstructor — BookTick stream |
+| `research/nasdaq/download.py` | Downloads historical ITCH files from NASDAQ (5–6 GB each) |
+| `research/nasdaq/show_scan.py` | Pretty-prints symbol scanner output |
+
+**Rust tool usage:**
+```bash
+# Parse one symbol → BookTick CSV (fast path for backtests)
+.\research\nasdaq\itch_rs\target\release\itch_parser.exe --file data.gz --symbol AAPL --out aapl_ticks.csv
+
+# Scan all 8900 symbols, rank by MM suitability
+.\research\nasdaq\itch_rs\target\release\itch_parser.exe --file data.gz --scan --top 50 --out scan.csv
+```
+
+#### Backtests
+| File | Purpose |
+|------|---------|
+| `research/backtest/nasdaq_mm_backtest.py` | Market-making backtest on ITCH tick data. Supports fast CSV path from Rust parser. |
+| `research/backtest/multi_sweep.py` | Multi-symbol, multi-date sweep (AAPL/MSFT/AMD across 3 dates) |
+| `research/backtest/bars_backtest.py` | Mean-reversion + momentum backtest on Alpaca minute bars (2yr recent data) |
+| `research/backtest/dex_arb_backtest.py` | DEX/CEX arbitrage backtest on collected spread data |
 
 ---
 
@@ -88,172 +110,100 @@ Ethernet RX
 Post quotes on both sides of the mid-price for AVAX/LINK/AAVE/INJ on Binance.
 Earn the bid-ask spread when filled. Cancel and re-quote when price moves (stale detection).
 
-**The economics at home internet:**
-- Fill rate: ~1 fill per 3 hours at quote_offset=3 ticks (AVAX)
-- Adverse selection: when you get filled, it's usually because price is moving against you
-- Profitable market making requires colocation (microsecond latency) to out-react other MMs
-
-**What this strategy needs to be viable:**
-- Colocation at exchange data centre (NY4/NY5 for Binance)
-- 10GbE NIC with kernel bypass (Solarflare XtremeScale, Mellanox ConnectX)
-- Completed OUCH 4.2 session layer (Phase 27) for real exchange connectivity
-
-**What it's good for:**
-- Learning market microstructure (why spreads exist, what adverse selection means)
-- Testing the full FPGA pipeline end-to-end
-- Benchmarking latency (Phase 25)
+**Why it's not viable from home:** Adverse selection eats all profit. Need colocation.
 
 ---
 
 ### Strategy B — DEX/CEX Crypto Arbitrage
-**Status: Monitor built (dex_monitor.py), data collection in progress.**
+**Status: Monitor built, backtest complete. Marginally unprofitable in current market.**
 
-Monitor the price of AVAX between Binance (CEX) and Trader Joe V1 DEX on Avalanche.
-When the gap exceeds round-trip fees (~0.40%), trade both legs simultaneously.
+Monitor price spread between Binance (CEX) and Trader Joe V1 DEX on Avalanche.
+Trade both legs when gap exceeds ~0.51% breakeven (fees + price impact + gas).
 
-**Why this works at home:**
-- DEX price updates once per Avalanche block (~2 seconds)
-- The arbitrage window is seconds, not microseconds
-- Home internet (50–100ms latency) is fast enough
-- No colocation required
-
-**Fee structure:**
-- Trader Joe V1 swap: 0.30%
-- Binance taker: 0.10%
-- Break-even threshold: 0.40% spread
-
-**Current data (2026-03-21, ~19:32 UTC):**
-- Live spread: ~0.323% (just below threshold)
-- Consistently directional: DEX price above CEX
-- Need overnight data to see how often spread exceeds 0.40%
-
-**What this strategy needs to execute:**
-- Avalanche wallet + web3.py transaction signing
-- DEX swap execution (Trader Joe V1 `swapExactTokensForTokens`)
-- CEX order execution (Binance API)
-- Own Avalanche node (eliminates public RPC latency)
-- Capital: $10k notional → ~$50–100/day theoretical if spread >0.40% often enough
-
-**The FPGA's role here:** None directly. This is a software-only strategy.
+**Current finding:** Max observed spread (0.428%) is below breakeven (0.510%). Only viable during high volatility events.
 
 ---
 
-### Strategy C — NASDAQ Stock Exchange HFT
-**Status: Design phase. ITCH 5.0 spec already on hand.**
+### Strategy C — NASDAQ Stock Market Making (Mean Reversion)
+**Status: Backtested and validated. Profitable on real data. Next: FPGA implementation.**
 
-Target real US equities via NASDAQ protocols:
-- **ITCH 5.0**: Binary UDP multicast feed — the real protocol for market data
-- **OUCH 4.x / SoupBinTCP**: Binary TCP protocol for order entry
+Quote passively at best bid/ask. Cancel quickly when mid moves (stale detection).
+Fade short-term price moves — profit from mean reversion.
 
-This is the highest educational value path. Everything we've built maps directly to real production infrastructure.
+**Backtest results (real ITCH data, 3 dates, 3 symbols):**
 
-**Why this is the right next step:**
-- NASDAQ publishes free historical ITCH 5.0 data (full order book, every message, every stock)
-- A realistic simulator can be built locally — no exchange access required
-- OUCH 4.x is what we've already partially implemented
-- The protocols are publicly documented (spec already in docs/)
-- Maps directly to what HFT firms actually run
+| Symbol | Avg P&L/hr | Dates Profitable | Best Params |
+|--------|-----------|-----------------|-------------|
+| AAPL | $+253/hr | 3/3 | offset=0, stale=2 |
+| MSFT | $+119/hr | 3/3 | offset=0, stale=2 |
+| AMD  | $+86/hr  | 3/3 | offset=0, stale=2 |
 
-**The execution stack:**
-```
-Historical ITCH data (NASDAQ FTP, free)
-    │
-    └─► ITCH replay tool (Python/Rust) ──► FPGA (via UDP, same as today)
-                                                │
-                                            Order book reconstruction
-                                                │
-                                            Strategy (market making or stat-arb)
-                                                │
-                                            OUCH 4.x / SoupBinTCP
-                                                │
-                                            Matching engine simulator (Rust, local)
-                                                │
-                                            ACK back to FPGA
-```
+**2-year minute bar backtest (Alpaca, 2024–2026):**
 
-**What needs to be built:**
-1. ITCH 5.0 parser (software replay + optionally FPGA native)
-2. SoupBinTCP session layer (wraps OUCH for real exchange compatibility)
-3. Matching engine simulator (Rust — foundation already exists in `research/market_engine/`)
-4. ITCH replay → FPGA feed bridge
+| Symbol | Strategy | Best P&L (2yr) | Sharpe |
+|--------|----------|---------------|--------|
+| NVDA | Mean reversion | $+5,444 | 11.0 |
+| MSFT | Mean reversion | $+3,590 | 58.3 |
+| AMD  | Mean reversion | $+2,770 | 7.0 |
+| AAPL | Mean reversion | $+2,219 | 7.2 |
+| QQQ  | Mean reversion | $+1,164 | 24.4 |
+
+**Momentum (EMA crossover): consistently unprofitable on all symbols — do not use.**
+
+**Key insight:** Mean reversion IS the market-making strategy. Fade short moves, capture spread. Works at both tick level (ITCH) and minute level (bars). The FPGA already implements this.
 
 ---
 
-## 3. Roadmap
+### Strategy D — Oslo Børs / Euronext Market Making
+**Status: Research phase.**
 
-### Near-term: Consolidation (no new hardware builds)
-These can be done without touching the FPGA RTL.
-
-| # | Task | What you learn |
-|---|------|---------------|
-| R1 | Run `dex_monitor.py` overnight | Whether DEX/CEX arb opportunity is real |
-| R2 | Analyse dex_monitor CSV: spread distribution, % above threshold | Data-driven strategy validation |
-| R3 | Set up Raspberry Pi running `data_collector.py` as systemd service | Linux services, continuous data collection |
-
-### Phase 25 — Latency Measurement
-Add 64-bit timestamp counters at 4 pipeline stages. Report min/avg/max in telemetry.
-- Target: market data in → order out < 1 µs
-- **Why:** Baseline measurement before any further optimisation. You can't improve what you don't measure.
-
-### Phase 26 — End-to-End System Testbench
-Fill the empty stubs in `tb/order_entry/` and `tb/market_data/`.
-A single cocotb test drives raw UDP ITCH bytes in, asserts correct OUCH bytes out.
-- **Why:** Safety net. Every phase so far has been tested at unit level only.
-
-### Phase 27 — OUCH 4.2 Session Layer (Production Gate)
-Replace bare-frame encoder with proper NASDAQ OUCH 4.2:
-- Login / Logout messages
-- Sequence numbers on every outbound message
-- Heartbeat every 1s when idle
-- Server heartbeat timeout watchdog
-- Session FSM: `LOGGED_OUT → LOGGING_IN → ACTIVE → LOGGING_OUT`
-
-**This is the production gate.** After Phase 27, the FPGA can talk to any OUCH-compatible simulator
-or test server, including NASDAQ's own test environment (for registered firms).
-
-### Phase 28 — ITCH 5.0 Replay Tool
-Build a tool that reads real NASDAQ historical ITCH data and replays it to the FPGA over UDP.
-- Parses the binary ITCH 5.0 format (spec in `docs/specs/NQTVITCHspecification.pdf`)
-- Translates to the FPGA's internal message format
-- Controls replay speed (real-time, 10×, unlimited)
-- **Why:** Lets you backtest against a real full trading day with microsecond-resolution data
-
-### Phase 29 — Stock Matching Engine Simulator
-Extend `research/market_engine/` (Rust) into a proper NASDAQ-style matching engine:
-- Accepts OUCH orders from FPGA
-- Matches against the replayed ITCH order book
-- Sends back ACKs (fills, cancels, rejects)
-- Tracks P&L, fill rate, adverse selection metrics
-- **Why:** Complete the loop. ITCH replay in → FPGA → OUCH orders → matching engine → results.
-
-### Phase 30 — Configurable Symbol Mapping (UART)
-Replace hardcoded identity routing with a UART-programmable 4-entry lookup table.
-Allows any 4 symbols from the ITCH feed to be assigned to the 4 FPGA slots at runtime.
-
-### Phase 31 — Book Depth Alpha Signal
-Wire `best_bid_qty` / `best_ask_qty` into strategy.
-Add order imbalance filter: suppress BUY if bid_qty >> ask_qty (adverse selection indicator).
-- **Why:** First step toward a real alpha signal beyond pure spread capture.
+Target European equities via Oslo Børs (Euronext group).
+- Oslo Børs uses NASDAQ ITCH protocol — FPGA parser works with minor modifications
+- Matching engine located in Basildon, UK (LD4) — Norway has 3–4× latency advantage over US firms
+- End goal: co-locate FPGA in LD4 data centre once profitable
 
 ---
 
-## 4. Technology Map
+## 3. Infrastructure
 
-```
-┌─────────────────────────────────────────────────────────┐
-│                    Learning Objectives                   │
-├──────────────────┬──────────────────┬───────────────────┤
-│  Market Structure│  FPGA / HW       │   Networking      │
-│                  │                  │                   │
-│ - Bid/ask spread │ - SystemVerilog  │ - UDP/TCP sockets │
-│ - Adverse select.│ - Timing closure │ - Ethernet frames │
-│ - Order book     │ - CDC pipelines  │ - ITCH 5.0 (UDP)  │
-│ - Inventory risk │ - Vivado tooling │ - OUCH/SoupBinTCP │
-│ - EMA filters    │ - Cocotb testing │ - Kernel bypass   │
-│ - DEX mechanics  │ - BRAM / LUT tradeoffs│- ARP/IP stack│
-│ - MEV / arb      │ - WNS/TNS timing │ - WebSocket feeds │
-└──────────────────┴──────────────────┴───────────────────┘
-```
+### Raspberry Pi (Data Collector)
+- Running `hft-collector` systemd service 24/7
+- Collecting Binance WebSocket ticks: AVAX, LINK, AAVE, INJ (~18 ticks/sec each)
+- ~90 MB/day, 6 GB free on SD card
+- Accessible via Tailscale VPN (`100.70.245.92`) from anywhere
+- SSH: `fredrikpi@100.70.245.92`
+
+### Data Available
+| Dataset | Location | Size | Coverage |
+|---------|----------|------|----------|
+| Binance ticks (live) | Pi: `~/hft-system/research/data/` | ~90 MB/day | Ongoing |
+| NASDAQ ITCH files | `research/data/nasdaq/*.gz` | 5–6 GB each | 3 dates (2019–2020) |
+| ITCH BookTick CSVs | `research/data/nasdaq/*_ticks.csv` | ~50–100 MB each | AAPL/MSFT/AMD × 3 dates |
+| Alpaca minute bars | `research/data/alpaca/*_bars_1Min_*.csv` | ~30 MB/symbol | 2024–2026 (2 years) |
+
+---
+
+## 4. Roadmap
+
+### Validated and Ready to Implement
+| # | Task | Notes |
+|---|------|-------|
+| Phase 25 | Latency measurement — timestamp counters at 4 pipeline stages | Baseline before optimisation |
+| Phase 26 | End-to-end testbench — raw ITCH UDP in → OUCH bytes out | Safety net for all future changes |
+| Phase 27 | OUCH 4.2 session layer (Login/Logout/Heartbeat/sequence numbers) | **Production gate** |
+| Phase 28 | ITCH 5.0 replay tool — feed historical data to FPGA over UDP | Enables real backtest loop |
+| Phase 29 | Matching engine simulator (Rust) — closes FPGA ↔ simulator loop | Full end-to-end validation |
+| Phase 30 | Configurable symbol mapping via UART | Replace hardcoded slot routing |
+| Phase 31 | Book depth alpha — order imbalance filter in strategy.sv | First real alpha signal |
+
+### Research Queue
+| Task | Status |
+|------|--------|
+| Oslo Børs / Euronext data feed access | Research needed |
+| Euronext co-location pricing (LD4) | Research needed |
+| Paper trading via Alpaca REST (live signal validation) | Ready to build |
+| Port mean-reversion strategy to RTL | Ready to build |
+| Collect more ITCH dates + symbols | 3 more files available on NASDAQ FTP |
 
 ---
 
@@ -263,12 +213,16 @@ Add order imbalance filter: suppress BUY if bid_qty >> ask_qty (adverse selectio
 |--------|-------|
 | FPGA clock | 125 MHz (8 ns period) |
 | Latest build WNS | +0.001 ns (timing met) |
-| Pipeline: market data → order out | ~8 clock cycles (~64 ns) measured in sim |
-| Symbols supported | 4 (expandable) |
-| UART baud | 115200 |
-| DEX poll interval | 2 s (Avalanche block time) |
-| AVAX fill rate (sim, offset=3) | ~1 fill / 3 hours |
-| Fee break-even (DEX/CEX arb) | 0.40% spread |
+| Pipeline latency (sim) | ~8 clock cycles (~64 ns) |
+| Symbols supported (FPGA) | 4 (expandable) |
+| ITCH parse speed (Rust) | 423M messages in ~2 min |
+| ITCH parse speed (Python) | 423M messages in ~15+ min |
+| AAPL book ticks per day | ~2M |
+| Best MM result (ITCH) | AAPL $499/hr (Jan 2020) |
+| Best MM result (avg, 3 dates) | AAPL $253/hr |
+| Best bar backtest (2yr) | NVDA mean-reversion $5,444 Sharpe=11 |
+| Pi tick collection rate | ~18 ticks/sec per symbol |
+| Tailscale Pi IP | 100.70.245.92 |
 
 ---
 
@@ -276,26 +230,39 @@ Add order imbalance filter: suppress BUY if bid_qty >> ask_qty (adverse selectio
 
 ```bash
 # Activate Python environment
-.\research\.venv\Scripts\activate
+.\.venv\Scripts\activate
 
 # Build FPGA
 & "C:\Xilinx\Vivado\2024.2\bin\vivado.bat" -mode tcl -source fpga/scripts/build.tcl
 
-# Run unit tests (strategy)
+# Run strategy unit tests
 cd fpga/tb/strategy && python runner_strategy.py
 
 # Run feed bridge (live Binance → FPGA)
 python software/feed_bridge.py
 
-# Run realistic ACK simulator
-python software/ack_simulator_realistic.py
-
 # Read FPGA telemetry
 python software/monitor.py
 
-# Run DEX/CEX spread monitor
-python research/monitors/dex_monitor.py --rpc https://avalanche-c-chain-rpc.publicnode.com
+# Parse ITCH file (Rust, fast)
+.\research\nasdaq\itch_rs\target\release\itch_parser.exe --file research\data\nasdaq\01302020.NASDAQ_ITCH50.gz --symbol AAPL --out research\data\nasdaq\aapl_ticks.csv
 
-# Set price base via UART (slot 0, value 2400)
-python software/set_price_base.py --slot 0 --value 2400
+# Run NASDAQ MM backtest (fast path)
+python research/backtest/nasdaq_mm_backtest.py --ticks-file research\data\nasdaq\aapl_20200130_ticks.csv --symbol AAPL --sweep
+
+# Run multi-symbol backtest sweep
+python research/backtest/multi_sweep.py
+
+# Run bars backtest (2yr Alpaca data)
+python research/backtest/bars_backtest.py --sweep
+
+# Download 2yr Alpaca minute bars
+python research/collectors/alpaca_history.py --days 730 --timeframe 1Min
+
+# Scan all NASDAQ symbols for MM candidates
+.\research\nasdaq\itch_rs\target\release\itch_parser.exe --file research\data\nasdaq\01302020.NASDAQ_ITCH50.gz --scan --top 50 --out research\data\nasdaq\scan.csv
+python research/nasdaq/show_scan.py research\data\nasdaq\scan.csv
+
+# SSH to Raspberry Pi (from anywhere via Tailscale)
+ssh fredrikpi@100.70.245.92
 ```
