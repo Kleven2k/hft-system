@@ -26,11 +26,24 @@ dump.vcd
 results.xml
 
 # ── Python ───────────────────────────────────────────────────
-research/.venv/
+**/.venv/
 __pycache__/
 *.pyc
 *.pyo
 .pytest_cache/
+
+# ── Research data ─────────────────────────────────────────────
+research/data/
+
+# ── Claude memory (machine-local) ────────────────────────────
+memory/
+
+# ── Rust build artifacts ─────────────────────────────
+research/nasdaq/itch_rs/target/
+
+# ── Secrets ──────────────────────────────────────────
+.env
+docs/git_token.txt
 
 # ── Editor / OS ──────────────────────────────────────────────
 .vscode/settings.json

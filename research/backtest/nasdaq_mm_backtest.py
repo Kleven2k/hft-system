@@ -38,6 +38,7 @@ Usage:
 """
 
 import argparse
+import csv
 import math
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -48,6 +49,25 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from nasdaq.order_book import OrderBook, BookTick
 from nasdaq.synthetic import generate_ticks
 from nasdaq.itch_parser import parse_file, SystemEvent
+
+
+def load_booktick_csv(path: Path):
+    """Load a pre-generated BookTick CSV (from the Rust itch_parser tool)."""
+    with open(path, newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            bid = float(row["best_bid"]) if row["best_bid"] else None
+            ask = float(row["best_ask"]) if row["best_ask"] else None
+            lt  = float(row["last_trade"]) if row["last_trade"] else None
+            yield BookTick(
+                timestamp_ns = int(row["ts_ns"]),
+                best_bid     = bid,
+                best_ask     = ask,
+                bid_size     = int(row["bid_size"]) if row["bid_size"] else 0,
+                ask_size     = int(row["ask_size"]) if row["ask_size"] else 0,
+                last_trade   = lt,
+                event        = row["event"],
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -323,6 +343,143 @@ def run_backtest(
 # Parameter sweep
 # ---------------------------------------------------------------------------
 
+def run_backtest_ticks(
+    symbol:    str,
+    ticks,              # iterable of BookTick objects (from CSV or order book)
+    params:    MMParams,
+    verbose:   bool = False,
+) -> MMResult:
+    """Same as run_backtest but takes BookTick objects directly (skips order book)."""
+    result = MMResult(symbol=symbol, params=params)
+
+    pending_side:  str   = ""
+    pending_price: float = 0.0
+    pending_mid:   float = 0.0
+    pending_ts:    int   = 0
+    pending        = False
+    cooldown_until_tick = -1
+
+    recent_mids: list[float] = []
+    LOOKAHEAD = 10
+
+    start_ts: int = 0
+    first     = True
+
+    for tick in ticks:
+        if tick.best_bid is None or tick.best_ask is None:
+            continue
+
+        mid = (tick.best_bid + tick.best_ask) / 2.0
+
+        if first:
+            start_ts = tick.timestamp_ns
+            first = False
+
+        result.n_ticks += 1
+        result.elapsed_ns = tick.timestamp_ns - start_ts
+
+        spd = (tick.best_ask - tick.best_bid) / mid * 10_000 if mid > 0 else None
+        if spd:
+            result.spread_bps_samples.append(spd)
+
+        recent_mids.append(mid)
+        if len(recent_mids) > LOOKAHEAD + 1:
+            recent_mids.pop(0)
+
+        if pending:
+            stale = abs(mid - pending_mid) > params.stale_ticks * params.tick_size
+            if stale:
+                pending = False
+                result.n_cancels += 1
+                continue
+
+            tol = params.tick_size * 0.5
+            filled = False
+            if (pending_side == "BUY"
+                    and tick.event in ("EXEC",)
+                    and tick.last_trade is not None
+                    and tick.last_trade <= pending_price + tol):
+                filled = True
+            elif (pending_side == "SELL"
+                    and tick.event in ("EXEC",)
+                    and tick.last_trade is not None
+                    and tick.last_trade >= pending_price - tol):
+                filled = True
+
+            if filled:
+                edge = mid - pending_price if pending_side == "BUY" else pending_price - mid
+                rebate = params.order_qty * params.maker_rebate_per_share
+                result.fill_edges.append(edge * params.order_qty)
+                result.total_pnl    += edge * params.order_qty + rebate
+                result.total_rebate += rebate
+                result.n_fills      += 1
+                result.hold_times_ns.append(tick.timestamp_ns - pending_ts)
+                future_mid = recent_mids[-1] if recent_mids else mid
+                adv = future_mid - pending_price if pending_side == "BUY" else pending_price - future_mid
+                result.adverse_moves.append(adv)
+                pending = False
+                cooldown_until_tick = result.n_ticks + 5
+                if verbose:
+                    print(f"  FILL {pending_side:4s}  price=${pending_price:.4f}"
+                          f"  mid=${mid:.4f}  edge=${edge*params.order_qty:+.4f}")
+            continue
+
+        if result.n_ticks < cooldown_until_tick:
+            continue
+
+        offset = params.quote_offset_usd()
+        buy_price  = tick.best_bid  - offset
+        sell_price = tick.best_ask  + offset
+
+        if result.n_fills % 2 == 0:
+            side, price = "BUY", buy_price
+        else:
+            side, price = "SELL", sell_price
+
+        if price <= 0:
+            continue
+
+        pending       = True
+        pending_side  = side
+        pending_price = price
+        pending_mid   = mid
+        pending_ts    = tick.timestamp_ns
+        result.n_orders += 1
+
+    return result
+
+
+def sweep_ticks(symbol: str, ticks_factory, tick_size: float) -> None:
+    """Sweep using pre-parsed BookTick objects (fast path)."""
+    offsets        = [0, 1, 2, 3, 5]
+    stale_threshes = [2, 3, 5, 10]
+
+    print(f"\n{'OFFSET':>8} {'STALE':>7} {'FILLS':>7} {'FILL%':>7}"
+          f" {'P&L':>10} {'P&L/HR':>9} {'AVG_EDGE':>10} {'ADV_SEL':>9} {'SHARPE':>8}")
+    print("-" * 85)
+
+    results = []
+    for qo in offsets:
+        for st in stale_threshes:
+            p = MMParams(quote_offset_ticks=qo, stale_ticks=st, tick_size=tick_size)
+            r = run_backtest_ticks(symbol, ticks_factory(), p)
+            results.append(r)
+
+    for r in sorted(results, key=lambda x: x.total_pnl, reverse=True):
+        p = r.params
+        print(
+            f"{p.quote_offset_ticks:>8d}"
+            f"{p.stale_ticks:>7d}"
+            f"{r.n_fills:>7d}"
+            f"{r.fill_rate():>7.1%}"
+            f"  ${r.total_pnl:>+8.4f}"
+            f"  ${r.pnl_per_hour():>+7.2f}"
+            f"  ${r.avg_edge():>+8.5f}"
+            f"  {r.adverse_selection_rate():>8.1%}"
+            f"  {r.sharpe():>7.2f}"
+        )
+
+
 def sweep(symbol: str, messages_factory, tick_size: float) -> None:
     offsets      = [0, 1, 2, 3, 5]
     stale_threshes = [2, 3, 5, 10]
@@ -375,6 +532,8 @@ def main() -> None:
                         help="Synthetic start price (default 185.0 for AAPL-like)")
     parser.add_argument("--synth-events",type=int, default=100_000,
                         help="Number of synthetic events (default 100000)")
+    parser.add_argument("--ticks-file",  default="",
+                        help="Pre-parsed BookTick CSV from Rust itch_parser (fast path)")
     parser.add_argument("--sweep",       action="store_true",
                         help="Sweep offset × stale_thresh parameter grid")
     parser.add_argument("--verbose",     action="store_true",
@@ -411,6 +570,29 @@ def main() -> None:
         print(result.summary())
         return
 
+    # Fast path: pre-parsed BookTick CSV from Rust tool
+    if args.ticks_file:
+        ticks_path = Path(args.ticks_file)
+        if not ticks_path.exists():
+            print(f"File not found: {ticks_path}")
+            return
+        print(f"Loading pre-parsed ticks from {ticks_path.name} ...")
+        if args.sweep:
+            cached = list(load_booktick_csv(ticks_path))
+            print(f"  Loaded {len(cached):,} ticks. Running sweep ...")
+            sweep_ticks(args.symbol, lambda: iter(cached), tick_size)
+        else:
+            params = MMParams(
+                quote_offset_ticks = args.offset,
+                stale_ticks        = args.stale,
+                tick_size          = tick_size,
+                order_qty          = args.qty,
+            )
+            result = run_backtest_ticks(args.symbol, load_booktick_csv(ticks_path), params, args.verbose)
+            print(f"\n-- Result --")
+            print(result.summary())
+        return
+
     # Real ITCH file
     if not args.file:
         print("Provide --file path/to/ITCH50.gz  or use --synthetic")
@@ -426,9 +608,10 @@ def main() -> None:
     print(f"Parsing {path.name}  symbol={args.symbol} ...")
 
     if args.sweep:
-        def make_messages():
-            return parse_file(path, symbol_filter=args.symbol)
-        sweep(args.symbol, make_messages, tick_size)
+        print(f"  Pre-loading {args.symbol} messages into memory (once) ...")
+        cached = list(parse_file(path, symbol_filter=args.symbol))
+        print(f"  Loaded {len(cached):,} messages. Running sweep ...")
+        sweep(args.symbol, lambda: iter(cached), tick_size)
         return
 
     params = MMParams(
