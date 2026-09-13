@@ -12,6 +12,7 @@ module strategy_tb_wrapper
     parameter int COOLDOWN_CYC   = 10,
     parameter int TIMEOUT_CYC    = 10_000,
     parameter int SKEW_SHIFT     = 0,    // inv_skew = position>>>0 = position (easy test math)
+    parameter int QUOTE_OFFSET   = 2000, // extra ticks inside bid/ask
     parameter int FAT_FINGER_BPS = 500,
     parameter int MAX_BURST         = 5,
     parameter int REFILL_PERIOD     = 200,   // > 5×COOLDOWN so refill never fires during drain tests
@@ -122,6 +123,15 @@ module strategy_tb_wrapper
     logic               telem_av_w   [0:3];
     logic        [63:0] telem_oid_w;
 
+    // Drive all 4 slots with the wrapper-level QUOTE_OFFSET parameter
+    logic [31:0] quote_offset_arr [0:3];
+    always_comb begin
+        quote_offset_arr[0] = 32'(QUOTE_OFFSET);
+        quote_offset_arr[1] = 32'(QUOTE_OFFSET);
+        quote_offset_arr[2] = 32'(QUOTE_OFFSET);
+        quote_offset_arr[3] = 32'(QUOTE_OFFSET);
+    end
+
     strategy #(
         .N_BOOKS       (4),
         .SPREAD_MAX    (SPREAD_MAX),
@@ -129,6 +139,7 @@ module strategy_tb_wrapper
         .COOLDOWN_CYC  (COOLDOWN_CYC),
         .TIMEOUT_CYC   (TIMEOUT_CYC),
         .SKEW_SHIFT    (SKEW_SHIFT),
+        .QUOTE_OFFSET  (QUOTE_OFFSET),
         .FAT_FINGER_BPS  (FAT_FINGER_BPS),
         .MAX_BURST       (MAX_BURST),
         .REFILL_PERIOD   (REFILL_PERIOD),
@@ -142,6 +153,7 @@ module strategy_tb_wrapper
         .spread        (spread_arr),
         .bid_valid     (bid_valid_arr),
         .ask_valid     (ask_valid_arr),
+        .quote_offset  (quote_offset_arr),
         .kill_switch   (kill_switch),
         .ack_valid     (ack_valid),
         .ack_order_id  (ack_order_id),

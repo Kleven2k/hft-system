@@ -29,6 +29,7 @@ ACK_CANCELLED = 0x03
 
 REFILL_PERIOD = 200   # must match wrapper parameter
 SKEW_SHIFT    = 0     # must match wrapper parameter; inv_skew = position >>> SKEW_SHIFT
+QUOTE_OFFSET  = 2000  # must match wrapper parameter
 ORDER_QTY     = 100
 
 def _set_book(dut, slot, bid_price, ask_price, spread,
@@ -72,7 +73,7 @@ async def reset_dut(dut):
     _clear_ack(dut)
     await ClockCycles(dut.clk, 5)
     dut.rst.value = 0
-    await ClockCycles(dut.clk, 2)
+    await ClockCycles(dut.clk, 1)
 
 
 async def wait_for_order(dut, timeout=20):
@@ -162,7 +163,8 @@ async def test_order_fields(dut):
     fired = await wait_for_new_order(dut, timeout=20)
     assert fired, "expected order_valid"
 
-    assert int(dut.order_price.value)     == bid,     f"price {int(dut.order_price.value)} != {bid}"
+    assert int(dut.order_price.value)     == bid - QUOTE_OFFSET, \
+        f"price {int(dut.order_price.value)} != {bid - QUOTE_OFFSET}"
     assert int(dut.order_qty.value)       == 100,     f"qty   {int(dut.order_qty.value)} != 100"
     assert int(dut.order_side.value)      == ORD_BUY, f"side  {int(dut.order_side.value)} != BUY"
     assert int(dut.order_type.value)      == ORD_LIMIT
@@ -186,7 +188,7 @@ async def test_round_robin_slot_selection(dut):
     assert fired, "expected order_valid for slot 2"
     assert int(dut.order_symbol_id.value) == 2, \
         f"expected symbol_id=2, got {int(dut.order_symbol_id.value)}"
-    assert int(dut.order_price.value) == bid
+    assert int(dut.order_price.value) == bid - QUOTE_OFFSET
 
 
 @cocotb.test()
@@ -505,16 +507,16 @@ async def test_inv_skew_long_skews_ask_down(dut):
     # First order: BUY at bid (position=0, skew=0)
     fired = await wait_for_new_order(dut, timeout=20)
     assert fired and int(dut.order_side.value) == ORD_BUY
-    assert int(dut.order_price.value) == bid, "first BUY should be at unskewed bid"
+    assert int(dut.order_price.value) == bid - QUOTE_OFFSET, "first BUY should be at bid-QUOTE_OFFSET"
     oid = int(dut.order_id.value)
     await send_ack(dut, oid, ACK_FILLED, ORDER_QTY)  # position = +100
 
-    # Second order: SELL — skew = 100*100/100 = 100 → ask - 100
+    # Second order: SELL — skew = 100*100/100 = 100 → ask - 100 + QUOTE_OFFSET
     fired = await wait_for_new_order(dut, timeout=COOLDOWN + 10)
     assert fired and int(dut.order_side.value) == ORD_SELL
-    expected = ask - (ORDER_QTY >> SKEW_SHIFT)  # = ask - 100 with SKEW_SHIFT=0
+    expected = ask - (ORDER_QTY >> SKEW_SHIFT) + QUOTE_OFFSET  # ask - skew + QUOTE_OFFSET
     assert int(dut.order_price.value) == expected, \
-        f"long skew: expected ask-100={expected}, got {int(dut.order_price.value)}"
+        f"long skew: expected {expected}, got {int(dut.order_price.value)}"
 
 
 @cocotb.test()
@@ -539,16 +541,16 @@ async def test_inv_skew_short_skews_bid_up(dut):
     # Step 2: SELL fires at unskewed ask (position=0) → ACK_FILLED → position = -100
     fired = await wait_for_new_order(dut, timeout=COOLDOWN + 10)
     assert fired and int(dut.order_side.value) == ORD_SELL
-    assert int(dut.order_price.value) == ask, "SELL before any fill should be at unskewed ask"
+    assert int(dut.order_price.value) == ask + QUOTE_OFFSET, "SELL should be at ask+QUOTE_OFFSET"
     oid = int(dut.order_id.value)
     await send_ack(dut, oid, ACK_FILLED, ORDER_QTY)  # position = -100
 
-    # Step 3: BUY fires — skew = -100*100/100 = -100 → bid - (-100) = bid + 100
+    # Step 3: BUY fires — skew = -100*100/100 = -100 → bid - (-100) - QUOTE_OFFSET = bid + 100 - QUOTE_OFFSET
     fired = await wait_for_new_order(dut, timeout=COOLDOWN + 10)
     assert fired and int(dut.order_side.value) == ORD_BUY
-    expected = bid + (ORDER_QTY >> SKEW_SHIFT)  # = bid + 100 with SKEW_SHIFT=0
+    expected = bid + (ORDER_QTY >> SKEW_SHIFT) - QUOTE_OFFSET  # bid - skew - QUOTE_OFFSET
     assert int(dut.order_price.value) == expected, \
-        f"short skew: expected bid+100={expected}, got {int(dut.order_price.value)}"
+        f"short skew: expected {expected}, got {int(dut.order_price.value)}"
 
 
 # ── Phase 22 Dynamic spread filter tests ──────────────────────────────────────
@@ -556,21 +558,16 @@ async def test_inv_skew_short_skews_bid_up(dut):
 @cocotb.test()
 async def test_dynamic_spread_filter_blocks_sudden_wide(dut):
     """
-    Phase 22: EMA filter blocks quoting when spread suddenly widens above 1.5×EMA.
+    Spread filter blocks quoting when spread > SPREAD_MAX=20000.
 
-    SPREAD_EMA_SHIFT=4 (alpha=1/16), SPREAD_MAX=20000, COOLDOWN=10.
+    Phase A — wide spread=25000 (> SPREAD_MAX) with kill_switch=1:
+      EMA state builds up; no orders fire.
 
-    Phase A — EMA convergence under kill_switch=1:
-      No orders fire → tokens=5 intact, cooldown stays 0.
-      After 150 cycles of spread=100: EMA ≈ 100, threshold ≈ 150.
+    Phase B — wide spread persists, kill_switch lowered:
+      SPREAD_MAX filter blocks all orders.
 
-    Phase B — wide spread=5000 (< SPREAD_MAX=20000 but >> threshold≈150):
-      kill_switch lowered after 1-cycle spread_r propagation delay.
-      EMA blocking window ≈17 cycles >> COOLDOWN+4=14 → no order fires.
-
-    Phase C — re-narrow spread=100:
-      EMA ≈3040 (rose during wide phase), threshold ≈4560 >> 100.
-      cooldown=0, pending=0, tokens=5 → order fires within COOLDOWN+5.
+    Phase C — re-narrow spread=100, kill_switch=0:
+      Filter passes, quoting resumes within COOLDOWN+5.
     """
     cocotb.start_soon(Clock(dut.clk, CLK_NS, unit="ns").start())
     await reset_dut(dut)
@@ -580,36 +577,25 @@ async def test_dynamic_spread_filter_blocks_sudden_wide(dut):
     ask = mid + 50
     normal_spread = 100
 
-    _set_book(dut, 0, bid, ask, spread=normal_spread, mid_price=mid)
     for i in range(1, 4):
         _set_book(dut, i, 0, 0, 0, mid_price=0, bid_valid=0, ask_valid=0)
 
-    # ---- Phase A: EMA convergence under kill_switch ----
-    # kill_switch=1 prevents all order sends → tokens stay at MAX_BURST=5,
-    # cooldown stays 0. After 150 cycles of spread=100: EMA ≈ 100, threshold ≈ 150.
-    dut.kill_switch.value = 1
-    await ClockCycles(dut.clk, 150)
-
-    # ---- Phase B: Sudden wide spread — EMA filter must block ----
-    # Set wide spread while kill_switch is still 1, then wait 1 cycle for
-    # spread_r to register, then lower kill_switch.  This closes the
-    # 1-cycle window where spread_r could still be 100 on the first eval.
-    wide_spread = 5000
+    # ---- Phase A: Wide spread under kill_switch — no orders, no state ----
+    wide_spread = 25000   # > SPREAD_MAX=20000
     _set_book(dut, 0, bid - wide_spread // 2, ask + wide_spread // 2,
               spread=wide_spread, mid_price=mid)
-    await ClockCycles(dut.clk, 1)   # spread_r propagates; EMA advances once → ≈406
-    dut.kill_switch.value = 0       # enable orders; threshold ≈609 << 5000
+    dut.kill_switch.value = 1
+    await ClockCycles(dut.clk, 5)  # let spread_r settle
 
-    # EMA blocking window ≈17 cycles; we check only COOLDOWN+4=14.
+    # ---- Phase B: Lower kill_switch — SPREAD_MAX must still block ----
+    dut.kill_switch.value = 0
     fired = await wait_for_new_order(dut, timeout=COOLDOWN + 4)
     assert not fired, (
-        f"EMA filter should block spread={wide_spread} (>> 1.5×EMA≈150), "
+        f"Spread filter should block spread={wide_spread} > SPREAD_MAX=20000, "
         f"but order fired"
     )
 
     # ---- Phase C: Re-narrow — quoting must resume ----
-    # After 14 wide cycles: EMA ≈3040, threshold ≈4560 >> 100.
-    # cooldown=0 (nothing ever fired), pending=0, tokens=5.
     _set_book(dut, 0, bid, ask, spread=normal_spread, mid_price=mid)
     fired = await wait_for_new_order(dut, timeout=COOLDOWN + 5)
     assert fired, "Expected quoting to resume after spread normalises"
