@@ -1,0 +1,35 @@
+.market-controls {
+  display: flex;
+  gap: 16px;
+  margin-bottom: 20px;
+}
+
+.market-controls label {
+  display: flex;
+  flex-direction: column;
+  font-size: 13px;
+  color: var(--text);
+  gap: 4px;
+}
+
+.market-controls input,
+.market-controls select {
+  padding: 6px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text-h);
+  font-size: 14px;
+}
+
+.market-chart-card {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px;
+  background: var(--code-bg);
+  min-height: 60px;
+}
+
+.market-error {
+  color: #ef4444;
+}

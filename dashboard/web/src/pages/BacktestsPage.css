@@ -1,0 +1,42 @@
+.results-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 15px;
+}
+
+.results-table th,
+.results-table td {
+  text-align: left;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+}
+
+.results-table th {
+  color: var(--text);
+  font-weight: 500;
+  background: var(--code-bg);
+}
+
+.results-table tbody tr:hover {
+  background: var(--accent-bg);
+}
+
+.results-table td.pnl-positive {
+  color: #22c55e;
+}
+
+.results-table td.pnl-negative {
+  color: #ef4444;
+}
+
+.equity-card {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px;
+  margin-top: 16px;
+  background: var(--code-bg);
+}
+
+.equity-card h2 {
+  margin: 0 0 12px;
+}

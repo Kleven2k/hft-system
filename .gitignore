@@ -35,11 +35,17 @@ __pycache__/
 # ── Research data ─────────────────────────────────────────────
 research/data/
 
-# ── Claude memory (machine-local) ────────────────────────────
+# ── Claude Code (machine-local) ──────────────────────────────
+CLAUDE.md
 memory/
 
 # ── Rust build artifacts ─────────────────────────────
 research/nasdaq/itch_rs/target/
+dashboard/api/target/
+
+# ── Dashboard web (Node) ──────────────────────────────
+dashboard/web/node_modules/
+dashboard/web/dist/
 
 # ── Secrets ──────────────────────────────────────────
 .env
