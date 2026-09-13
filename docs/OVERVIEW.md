@@ -1,6 +1,6 @@
 # HFT System — Project Overview
 
-> Last updated: 2026-03-22
+> Last updated: 2026-09-13
 > Hardware: Digilent Nexys Video (Xilinx Artix-7 XC7A200T), 125 MHz system clock
 > Goal: Build a real HFT system — FPGA market-making pipeline, validated strategies, path to live trading.
 
@@ -13,6 +13,7 @@
 The FPGA implements a complete market-making pipeline in hardware. Everything from Ethernet frame reception
 to order transmission runs without CPU involvement.
 
+**Paper-trading path (UDP, always active):**
 ```
 Ethernet RX
     │
@@ -26,12 +27,22 @@ Ethernet RX
                                     │
                                     └─► order_engine.sv          — OMS: order table, risk, watchdog
                                             │
-                                            └─► ouch_encoder.sv          — Serialises OUCH order frames
-                                                    │
-                                                    └─► eth_stack_wrapper.sv     — Ethernet TX (UDP)
+                                            ├─► ouch_encoder.sv          — Serialises OUCH 4.2 order frames
+                                            │           │
+                                            │           ├─► soup_session.sv     — SoupBinTCP Login/HB/framing
+                                            │           │           │
+                                            │           │           └─► tcp_engine.sv    — ARP/TCP handshake/TX/RX
+                                            │           │
+                                            │           └─► eth_stack_wrapper.sv — UDP telemetry + paper-mode ACK
+                                            │
+                                            └─► mac_tx_arbiter.sv     — 2:1 TX arbiter (TCP priority over UDP)
 ```
 
-**Completed features (hardware-validated on Nexys Video):**
+Both TCP (live) and UDP (paper) paths are active simultaneously:
+- **Paper mode:** FPGA → UDP → `ack_simulator.py` → UDP ACK → FPGA
+- **Live mode:** FPGA → TCP → exchange → execution reports → TCP ACK → FPGA
+
+**Completed features (hardware-validated on Nexys Video unless noted):**
 
 | Phase | Feature | Status |
 |-------|---------|--------|
@@ -44,27 +55,84 @@ Ethernet RX
 | 22 | Dynamic EMA spread filter (suppresses quoting in high-spread regimes) | ✓ HW validated |
 | 23 | Timing closure — WNS positive after pipeline optimisations | ✓ WNS=+0.001ns |
 | 24 | UART-configurable quote_offset per slot + software stop-loss | ✓ WNS=+0.001ns |
+| 25 | Latency measurement — timestamp counters at 4 pipeline stages via telemetry | ✓ WNS=+0.006ns, HW validated |
+| 26 | End-to-end cocotb testbench — raw ITCH UDP in → OUCH bytes out (6 tests) | ✓ 6/6 pass, WNS=+0.018ns |
+| 27 | Full FPGA TCP: `tcp_engine` + `soup_session` — direct order submission | ✓ HW validated — Login Accepted, heartbeats confirmed |
+| 28 | Binance live trading pipeline + queue-position backtest sim | ✓ HW validated — 10 orders/sec BUY/SELL on AAVE+INJ |
 
 **Known gaps / not yet built:**
 
 - `best_bid_qty` / `best_ask_qty` wired to order_book output but not yet consumed by strategy
 - No UART readback path (TX is echo-loopback only)
 - Symbol routing is identity-mapped (slot 0 = symbol 0, hardcoded)
-- No end-to-end simulation testbench (tb/order_entry and tb/market_data are empty stubs)
-- OUCH session layer is bare-frame only — no Login/Logout/Heartbeat/sequence numbers
+- No TCP retransmit timer — LAN is assumed reliable for initial deployment
 - ARP uses broadcast MAC (functional but not production-grade)
 
-### 1.2 Software
+### 1.2 Phase 27 — Full FPGA TCP (SoupBinTCP / OUCH 4.2)
+
+Phase 27 eliminates software from the order critical path. The FPGA opens a TCP connection to the exchange
+and sends OUCH 4.2 orders directly.
+
+**New RTL files:**
+
+| File | Purpose |
+|------|---------|
+| `fpga/rtl/eth/tcp_engine.sv` | Minimal TCP client: ARP → 3-way handshake → PSH+ACK data TX, pure-ACK RX. Single connection, no retransmit (LAN assumed reliable). All timing-safe: no `always_comb`, checksums computed in one `S_TX_PREP` cycle from precomputed parameter constants. |
+| `fpga/rtl/eth/mac_tx_arbiter.sv` | 2:1 MAC TX arbiter — `tcp_engine` (priority 0) vs UDP telemetry/paper-ACK (priority 1). |
+| `fpga/rtl/order_entry/soup_session.sv` | SoupBinTCP session layer on top of `tcp_engine`. Sends Login Request on connect, heartbeat every HB_CYC cycles, wraps OUCH frames in 'U' unsequenced data, parses inbound 'A'/'S' execution reports. |
+
+**Configuration (parameters):**
+- Exchange IP/port: `tcp_engine` parameters `SERVER_IP`, `SERVER_PORT`
+- Credentials: `soup_session` parameters `SOUP_USER`, `SOUP_PASS`
+- Heartbeat interval: `soup_session` parameter `HB_CYC` (default 125,000,000 = 1s at 125 MHz)
+
+**Testbench:** `fpga/tb/tcp/` — 6 cocotb tests (ARP, TCP handshake, Login, Order submit, Exec report, Heartbeat).
+Run: `python fpga/tb/tcp/runner_tcp.py`
+
+**Hardware validation (2026-04-23):** fixed by bypassing the arbiter (tcp_engine wired direct to MAC).
+Login Accepted and heartbeat exchange confirmed on real hardware against `software/exchange_sim.py`.
+
+### 1.2b Phase 28 — Binance Live Trading Pipeline
+
+Closes the loop from a live market feed to a simulated exchange fill, entirely through the FPGA.
+
+```
+Binance WebSocket → feed_bridge.py → FPGA (UDP market data)
+                                          → strategy → order_engine → ouch_encoder
+                                              → soup_session → tcp_engine → TCP → exchange_sim.py
+```
+
+**New software:**
+
+| File | Purpose |
+|------|---------|
+| `software/exchange_sim.py` | Full TCP/SoupBinTCP/OUCH 4.2 exchange simulator — accepts the FPGA's live connection, login, and orders; sends back execution reports. Used to validate Phase 27's TCP path without a real exchange. |
+| `software/ouch_session.py` | OUCH session client library shared by exchange_sim and other tools. |
+
+**Fixes during bring-up:**
+- Token decode bug in `soup_session.sv` — `token_to_id` nibble order was reversed, causing order tokens to mismatch on exec reports.
+- `strategy.sv` `QUOTE_OFFSET` moved from a compile-time parameter to a UART-configurable runtime `quote_offset[]` per slot, so live parameters can be tuned without a rebuild. This added a second serial subtract to the inventory-skew critical path, fixed by an extra pipeline stage.
+
+**Validated (2026-04-25):** full pipeline running continuously — 10 orders/sec BUY/SELL on AAVE and INJ,
+with stale orders correctly cancelled and fills correctly executed against `exchange_sim.py`.
+
+**Backtest addition:** `research/backtest/backtest.py` now supports `--fill-prob` to simulate queue position
+(a touch at the quoted price fills probabilistically rather than immediately, approximating resting behind
+other orders). Realistic AVAX estimate at `fill_prob=0.2`: ~$18/day.
+
+### 1.3 Software
 
 | File | Purpose |
 |------|---------|
 | `software/feed_bridge.py` | Bridges Binance WebSocket → FPGA market data feed. Sends UART price_base + quote_offset config at startup. |
-| `software/ack_simulator.py` | Simple ACK simulator — always fills every order. Useful for smoke tests. |
-| `software/monitor.py` | Reads UDP telemetry from FPGA: P&L, fill counts, position, order counts per slot. |
+| `software/ack_simulator.py` | Simple ACK simulator — always fills every order. Useful for smoke tests (paper mode). |
+| `software/monitor.py` | Reads UDP telemetry from FPGA: P&L, fill counts, position, order counts per slot, pipeline latency. |
 | `software/set_price_base.py` | UART tool: sends price_base calibration for a given slot. |
 | `software/set_risk.py` | UART tool: configures fat-finger limit, kill switch. |
+| `software/exchange_sim.py` | Full TCP/SoupBinTCP/OUCH 4.2 exchange simulator for validating the live order path (Phase 27/28). |
+| `software/ouch_session.py` | OUCH session client library shared across tools. |
 
-### 1.3 Research & Backtesting
+### 1.4 Research & Backtesting
 
 #### Data Collection
 | File | Purpose |
@@ -171,7 +239,36 @@ Target European equities via Oslo Børs (Euronext group).
 - Collecting Binance WebSocket ticks: AVAX, LINK, AAVE, INJ (~18 ticks/sec each)
 - ~90 MB/day, 6 GB free on SD card
 - Accessible via Tailscale VPN (`100.70.245.92`) from anywhere
-- SSH: `fredrikpi@100.70.245.92`
+- SSH: `fredrikpi@100.70.245.92` (passwordless via SSH key)
+
+**Checking Pi services/processes:**
+```bash
+# Check the tick collector
+ssh fredrikpi@100.70.245.92 "sudo systemctl status hft-collector"
+
+# Check the DEX monitor
+ssh fredrikpi@100.70.245.92 "sudo systemctl status hft-dex-monitor"
+
+# List all hft-* services at once
+ssh fredrikpi@100.70.245.92 "systemctl list-units 'hft-*' --all"
+
+# Live logs (Ctrl+C to stop)
+ssh fredrikpi@100.70.245.92 "journalctl -u hft-collector -f"
+
+# Raw process list
+ssh fredrikpi@100.70.245.92 "ps aux | grep python"
+```
+
+**Syncing collected data to laptop:**
+```bash
+bash research/collectors/sync_from_pi.sh
+```
+Pulls latest CSVs from `~/hft-system/research/data/` on the Pi into the local `research/data/` folder via `scp`, then deletes the Pi-side copies of files from previous days (today's file is kept — the collector still has it open for writing). Run this periodically to keep the Pi's ~15GB SD card from filling up (~90MB/day).
+
+**Disk space backstop:** a daily cron job on the Pi (4 AM) deletes any CSV older than 14 days regardless of sync status, as a safety net if syncing is forgotten:
+```
+0 4 * * * find /home/fredrikpi/hft-system/research/data -name "*.csv" -mtime +14 -delete
+```
 
 ### Data Available
 | Dataset | Location | Size | Coverage |
@@ -185,16 +282,22 @@ Target European equities via Oslo Børs (Euronext group).
 
 ## 4. Roadmap
 
-### Validated and Ready to Implement
+### Completed
+| Phase | Task | Notes |
+|-------|------|-------|
+| 25 | Latency measurement — timestamp counters at 4 pipeline stages | WNS=+0.006ns, HW validated |
+| 26 | End-to-end testbench — raw ITCH UDP in → OUCH bytes out | 6/6 cocotb tests pass, WNS=+0.018ns |
+| 27 | Full FPGA TCP/SoupBinTCP/OUCH 4.2 order submission | HW validated — Login Accepted, heartbeats confirmed |
+| 28 | Binance live trading pipeline + queue-position backtest sim | HW validated — 10 orders/sec BUY/SELL on AAVE+INJ |
+
+### Next Up
 | # | Task | Notes |
 |---|------|-------|
-| Phase 25 | Latency measurement — timestamp counters at 4 pipeline stages | Baseline before optimisation |
-| Phase 26 | End-to-end testbench — raw ITCH UDP in → OUCH bytes out | Safety net for all future changes |
-| Phase 27 | OUCH 4.2 session layer (Login/Logout/Heartbeat/sequence numbers) | **Production gate** |
-| Phase 28 | ITCH 5.0 replay tool — feed historical data to FPGA over UDP | Enables real backtest loop |
-| Phase 29 | Matching engine simulator (Rust) — closes FPGA ↔ simulator loop | Full end-to-end validation |
-| Phase 30 | Configurable symbol mapping via UART | Replace hardcoded slot routing |
-| Phase 31 | Book depth alpha — order imbalance filter in strategy.sv | First real alpha signal |
+| Phase 29 | TCP retransmit timer | Low priority — LAN is reliable; needed before WAN deployment |
+| Phase 29 | ITCH 5.0 replay tool — feed historical data to FPGA over UDP | Enables real backtest loop |
+| Phase 30 | Matching engine simulator (Rust) — closes FPGA ↔ simulator loop | Full end-to-end validation |
+| Phase 31 | Configurable symbol mapping via UART | Replace hardcoded slot routing |
+| Phase 32 | Book depth alpha — order imbalance filter in strategy.sv | First real alpha signal |
 
 ### Research Queue
 | Task | Status |
@@ -204,6 +307,7 @@ Target European equities via Oslo Børs (Euronext group).
 | Paper trading via Alpaca REST (live signal validation) | Ready to build |
 | Port mean-reversion strategy to RTL | Ready to build |
 | Collect more ITCH dates + symbols | 3 more files available on NASDAQ FTP |
+| Live exchange validation (real venue, not exchange_sim) | Not yet attempted |
 
 ---
 
@@ -212,9 +316,10 @@ Target European equities via Oslo Børs (Euronext group).
 | Metric | Value |
 |--------|-------|
 | FPGA clock | 125 MHz (8 ns period) |
-| Latest build WNS | +0.001 ns (timing met) |
+| Latest build WNS | +0.018 ns (Phase 26, timing met) |
 | Pipeline latency (sim) | ~8 clock cycles (~64 ns) |
 | Symbols supported (FPGA) | 4 (expandable) |
+| Testbench coverage | 6/6 strategy + 6/6 TCP + 6/6 e2e tests |
 | ITCH parse speed (Rust) | 423M messages in ~2 min |
 | ITCH parse speed (Python) | 423M messages in ~15+ min |
 | AAPL book ticks per day | ~2M |
@@ -238,11 +343,23 @@ Target European equities via Oslo Børs (Euronext group).
 # Run strategy unit tests
 cd fpga/tb/strategy && python runner_strategy.py
 
+# Run Phase 26 end-to-end tests (ITCH→OUCH)
+python fpga/tb/strategy/runner_strategy.py
+
+# Run Phase 27 TCP/SoupBinTCP tests
+python fpga/tb/tcp/runner_tcp.py
+
+# Run single TCP test
+python fpga/tb/tcp/runner_tcp.py test_tcp_handshake
+
 # Run feed bridge (live Binance → FPGA)
 python software/feed_bridge.py
 
 # Read FPGA telemetry
 python software/monitor.py
+
+# Paper-mode ACK simulator
+python software/ack_simulator.py
 
 # Parse ITCH file (Rust, fast)
 .\research\nasdaq\itch_rs\target\release\itch_parser.exe --file research\data\nasdaq\01302020.NASDAQ_ITCH50.gz --symbol AAPL --out research\data\nasdaq\aapl_ticks.csv
