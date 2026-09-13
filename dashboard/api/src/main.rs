@@ -1,4 +1,4 @@
-use axum::{extract::Query, http::StatusCode, routing::get, Json, Router};
+use axum::{extract::{Query, State}, http::StatusCode, routing::get, Json, Router};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::SystemTime;
@@ -6,9 +6,15 @@ use tower_http::cors::{Any, CorsLayer};
 
 mod backtest;
 mod market;
+mod telemetry;
 
 use backtest::{find_csv_for_date, find_latest_csv, list_dates_for, load_csv, run_backtest, tick_size_for, StrategyParams};
 use market::{fetch_klines, MarketQuery};
+use telemetry::{SharedTelemetry, TelemetrySnapshot};
+
+async fn get_telemetry(State(telem): State<SharedTelemetry>) -> Json<TelemetrySnapshot> {
+    Json(telem.lock().unwrap().clone())
+}
 
 async fn get_market(Query(q): Query<MarketQuery>) -> Result<Json<Vec<market::Candle>>, (StatusCode, String)> {
     fetch_klines(&q.symbol, &q.interval, 200)
@@ -147,6 +153,11 @@ async fn get_status() -> Json<StatusResponse> {
 #[tokio::main]
 async fn main() {
     let cors = CorsLayer::new().allow_origin(Any);
+    let telemetry_state = telemetry::spawn_listener();
+
+    let telemetry_routes = Router::new()
+        .route("/api/telemetry", get(get_telemetry))
+        .with_state(telemetry_state);
 
     let app = Router::new()
         .route("/api/backtest", get(get_backtest))
@@ -154,6 +165,7 @@ async fn main() {
         .route("/api/tick-dates", get(get_tick_dates))
         .route("/api/ticks", get(get_ticks))
         .route("/api/market", get(get_market))
+        .merge(telemetry_routes)
         .layer(cors);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:8080").await.unwrap();

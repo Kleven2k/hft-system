@@ -1,0 +1,144 @@
+.status-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 16px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--code-bg);
+  font-size: 14px;
+  margin-bottom: 24px;
+}
+
+.status-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.status-dot.ok {
+  background: #22c55e;
+}
+
+.status-dot.stale {
+  background: #eab308;
+}
+
+.status-dot.down {
+  background: #ef4444;
+}
+
+.slot-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 16px;
+  margin-bottom: 32px;
+}
+
+.slot-card {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px;
+  background: var(--code-bg);
+}
+
+.slot-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+
+.slot-symbol {
+  font-weight: 600;
+  color: var(--text-h);
+}
+
+.slot-badge.stop-loss {
+  font-size: 11px;
+  font-weight: 600;
+  color: #ef4444;
+  border: 1px solid #ef4444;
+  border-radius: 4px;
+  padding: 2px 6px;
+}
+
+.slot-empty {
+  color: var(--text);
+  font-size: 13px;
+}
+
+.slot-pnl {
+  font-size: 22px;
+  font-weight: 600;
+  margin-bottom: 12px;
+}
+
+.slot-row {
+  display: flex;
+  justify-content: space-between;
+  font-size: 13px;
+  color: var(--text);
+  padding: 3px 0;
+}
+
+.flag-ok {
+  color: #22c55e;
+  font-weight: 600;
+}
+
+.flag-off {
+  color: var(--text);
+  opacity: 0.4;
+}
+
+.token-bucket {
+  display: flex;
+  gap: 4px;
+  margin-top: 10px;
+}
+
+.token {
+  width: 14px;
+  height: 14px;
+  border-radius: 3px;
+  border: 1px solid var(--border);
+  background: transparent;
+}
+
+.token.filled {
+  background: var(--accent-border, #3b82f6);
+  border-color: var(--accent-border, #3b82f6);
+}
+
+.latency-card {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px;
+  background: var(--code-bg);
+}
+
+.latency-row {
+  display: flex;
+  gap: 32px;
+  flex-wrap: wrap;
+}
+
+.latency-row > div {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.latency-label {
+  font-size: 12px;
+  color: var(--text);
+  opacity: 0.7;
+}
+
+.latency-value {
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--text-h);
+}
