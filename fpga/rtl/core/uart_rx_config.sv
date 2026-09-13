@@ -10,6 +10,13 @@
 //   Byte 3 : base[15:8]
 //   Byte 4 : base[7:0]
 //
+// 5-byte quote_offset frame (big-endian):
+//   Byte 0 : 0xC0 | slot[1:0]   sync + slot select (0–3)
+//   Byte 1 : offset[31:24]
+//   Byte 2 : offset[23:16]
+//   Byte 3 : offset[15:8]
+//   Byte 4 : offset[7:0]
+//
 // 1-byte kill-switch commands (Phase 16):
 //   0xB0 — kill switch ON  (halt all new order emission)
 //   0xB1 — kill switch OFF (resume order emission)
@@ -33,6 +40,11 @@ module uart_rx_config
     output logic                          wr_en,
     output logic [$clog2(N_BOOKS)-1:0]   wr_slot,
     output logic [31:0]                   wr_base,
+
+    // Write port to quote_offset registers
+    output logic                          wr_offset_en,
+    output logic [$clog2(N_BOOKS)-1:0]   wr_offset_slot,
+    output logic [31:0]                   wr_offset_val,
 
     // Kill switch (Phase 16): latched by 0xB0/0xB1 UART commands
     output logic                          kill_switch
@@ -122,31 +134,43 @@ module uart_rx_config
     end
 
     // ── Frame parser ─────────────────────────────────────────
-    // Frame: { 0xA0|slot, base[31:24], base[23:16], base[15:8], base[7:0] }
+    // Handles two 5-byte frame types (0xA0|slot and 0xC0|slot).
     typedef enum logic [2:0] { P_SYNC, P_B1, P_B2, P_B3, P_B4 } parser_state_t;
     parser_state_t   p_state;
     logic [1:0]      p_slot;
-    logic [31:8]     p_base_hi;   // accumulates bytes 1–3
+    logic [31:8]     p_data_hi;   // accumulates bytes 1–3
+    logic            p_is_offset; // 1 = quote_offset frame, 0 = price_base frame
 
     always_ff @(posedge clk) begin
         if (rst) begin
-            p_state    <= P_SYNC;
-            p_slot     <= '0;
-            p_base_hi  <= '0;
-            wr_en      <= 1'b0;
-            wr_slot    <= '0;
-            wr_base    <= '0;
-            kill_switch<= 1'b0;
+            p_state       <= P_SYNC;
+            p_slot        <= '0;
+            p_data_hi     <= '0;
+            p_is_offset   <= 1'b0;
+            wr_en         <= 1'b0;
+            wr_slot       <= '0;
+            wr_base       <= '0;
+            wr_offset_en  <= 1'b0;
+            wr_offset_slot<= '0;
+            wr_offset_val <= '0;
+            kill_switch   <= 1'b0;
         end else begin
-            wr_en <= 1'b0;
+            wr_en        <= 1'b0;
+            wr_offset_en <= 1'b0;
 
             if (rx_valid) begin
                 case (p_state)
                     P_SYNC: begin
                         if (rx_byte[7:2] == 6'b10_1000) begin
                             // 0xA0–0xA3: price_base 5-byte frame
-                            p_slot  <= rx_byte[1:0];
-                            p_state <= P_B1;
+                            p_slot      <= rx_byte[1:0];
+                            p_is_offset <= 1'b0;
+                            p_state     <= P_B1;
+                        end else if (rx_byte[7:2] == 6'b11_0000) begin
+                            // 0xC0–0xC3: quote_offset 5-byte frame
+                            p_slot      <= rx_byte[1:0];
+                            p_is_offset <= 1'b1;
+                            p_state     <= P_B1;
                         end else if (rx_byte == 8'hB0) begin
                             kill_switch <= 1'b1;   // kill ON
                         end else if (rx_byte == 8'hB1) begin
@@ -156,24 +180,30 @@ module uart_rx_config
                     end
 
                     P_B1: begin
-                        p_base_hi[31:24] <= rx_byte;
+                        p_data_hi[31:24] <= rx_byte;
                         p_state          <= P_B2;
                     end
 
                     P_B2: begin
-                        p_base_hi[23:16] <= rx_byte;
+                        p_data_hi[23:16] <= rx_byte;
                         p_state          <= P_B3;
                     end
 
                     P_B3: begin
-                        p_base_hi[15:8] <= rx_byte;
+                        p_data_hi[15:8] <= rx_byte;
                         p_state         <= P_B4;
                     end
 
                     P_B4: begin
-                        wr_en   <= 1'b1;
-                        wr_slot <= p_slot;
-                        wr_base <= {p_base_hi, rx_byte};
+                        if (p_is_offset) begin
+                            wr_offset_en   <= 1'b1;
+                            wr_offset_slot <= p_slot;
+                            wr_offset_val  <= {p_data_hi, rx_byte};
+                        end else begin
+                            wr_en   <= 1'b1;
+                            wr_slot <= p_slot;
+                            wr_base <= {p_data_hi, rx_byte};
+                        end
                         p_state <= P_SYNC;
                     end
 

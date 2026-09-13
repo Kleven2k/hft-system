@@ -14,12 +14,18 @@ module symbol_router
     output quote_t book [0:N_BOOKS-1]
 );
 
-    always_comb begin
-        for (int i = 0; i < N_BOOKS; i++)
-            book[i] = '0;
-
-        if (quote_in.valid && quote_in.symbol_id < N_BOOKS)
-            book[quote_in.symbol_id] = quote_in;
-    end
+    // Per-slot combinational routing: each slot independently checks symbol_id.
+    // This form avoids icarus's "constant selects in always_*" limitation with
+    // loop-indexed unpacked arrays.  Vivado synthesizes identically.
+    generate
+        for (genvar i = 0; i < N_BOOKS; i++) begin : gen_route
+            always_comb begin
+                if (quote_in.valid && (int'(quote_in.symbol_id) == i))
+                    book[i] = quote_in;
+                else
+                    book[i] = '0;
+            end
+        end
+    endgenerate
 
 endmodule

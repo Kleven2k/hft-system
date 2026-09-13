@@ -1,12 +1,12 @@
 // ============================================================
-// telemetry_tx.sv — UDP telemetry transmitter (Phase 20/21B)
+// telemetry_tx.sv — UDP telemetry transmitter (Phase 20/21B/25)
 //
 // Every TELEM_PERIOD cycles, snapshots strategy state and
-// streams a 64-byte UDP payload on the AXI-S interface.
+// streams an 80-byte UDP payload on the AXI-S interface.
 // Runs in clk domain; caller provides axis_async_fifo to
 // cross to rgmii_rxc (enc_clk) before the AXI arbiter.
 //
-// Packet layout (big-endian, 64 bytes):
+// Packet layout (big-endian, 80 bytes):
 //   [  0- 3]  magic  0x48465401  ('HFT\x01')
 //   [  4- 7]  seq_num (uint32, wraps)
 //   [  8-15]  telem_order_id_cnt (uint64)
@@ -17,6 +17,11 @@
 //     flags byte: bit0=bid_valid  bit1=ask_valid
 //     pnl: signed int32, edge-vs-mid in price ticks (1 tick = $0.0001)
 //          positive = capturing spread, negative = paying to unwind inventory
+//   --- Phase 25: latency stats (bytes 64-79) ---
+//   [ 64-67]  lat_min   (uint32, clock cycles, 8 ns each)
+//   [ 68-71]  lat_max   (uint32, clock cycles)
+//   [ 72-75]  lat_last  (uint32, clock cycles)
+//   [ 76-79]  lat_count (uint32, number of measurements)
 //
 // Clock domain: clk (125 MHz)
 // ============================================================
@@ -46,6 +51,12 @@ module telemetry_tx
     output logic        tx_tlast,
     output logic        tx_tuser,
 
+    // Latency stats from latency_monitor (clk domain)
+    input  logic [31:0] lat_min,
+    input  logic [31:0] lat_max,
+    input  logic [31:0] lat_last,
+    input  logic [31:0] lat_count,
+
     // UDP sideband — constant, registered once at reset
     output logic [47:0] tx_dst_mac,
     output logic [31:0] tx_dst_ip,
@@ -54,7 +65,7 @@ module telemetry_tx
     output logic [15:0] tx_length
 );
 
-    localparam int PKT_BYTES = 64;
+    localparam int PKT_BYTES = 80;
     localparam int TP_W     = $clog2(TELEM_PERIOD + 1);
     localparam int IDX_W    = $clog2(PKT_BYTES);
 
@@ -87,6 +98,10 @@ module telemetry_tx
     logic               l_av  [0:N_BOOKS-1];
     logic        [63:0] l_oid;
     logic        [31:0] seq_num;
+    logic        [31:0] l_lat_min;
+    logic        [31:0] l_lat_max;
+    logic        [31:0] l_lat_last;
+    logic        [31:0] l_lat_count;
 
     // ---- State machine -----------------------------------------
     typedef enum logic { IDLE, SEND } state_t;
@@ -106,75 +121,92 @@ module telemetry_tx
     always_comb begin
         case (byte_idx)
             // Magic + seq_num (bytes 0-7)
-            6'd0:  cur_byte = 8'h48;
-            6'd1:  cur_byte = 8'h46;
-            6'd2:  cur_byte = 8'h54;
-            6'd3:  cur_byte = 8'h01;
-            6'd4:  cur_byte = seq_num[31:24];
-            6'd5:  cur_byte = seq_num[23:16];
-            6'd6:  cur_byte = seq_num[15:8];
-            6'd7:  cur_byte = seq_num[7:0];
+            7'd0:  cur_byte = 8'h48;
+            7'd1:  cur_byte = 8'h46;
+            7'd2:  cur_byte = 8'h54;
+            7'd3:  cur_byte = 8'h01;
+            7'd4:  cur_byte = seq_num[31:24];
+            7'd5:  cur_byte = seq_num[23:16];
+            7'd6:  cur_byte = seq_num[15:8];
+            7'd7:  cur_byte = seq_num[7:0];
             // order_id_cnt (bytes 8-15)
-            6'd8:  cur_byte = l_oid[63:56];
-            6'd9:  cur_byte = l_oid[55:48];
-            6'd10: cur_byte = l_oid[47:40];
-            6'd11: cur_byte = l_oid[39:32];
-            6'd12: cur_byte = l_oid[31:24];
-            6'd13: cur_byte = l_oid[23:16];
-            6'd14: cur_byte = l_oid[15:8];
-            6'd15: cur_byte = l_oid[7:0];
+            7'd8:  cur_byte = l_oid[63:56];
+            7'd9:  cur_byte = l_oid[55:48];
+            7'd10: cur_byte = l_oid[47:40];
+            7'd11: cur_byte = l_oid[39:32];
+            7'd12: cur_byte = l_oid[31:24];
+            7'd13: cur_byte = l_oid[23:16];
+            7'd14: cur_byte = l_oid[15:8];
+            7'd15: cur_byte = l_oid[7:0];
             // Slot 0 (bytes 16-27)
-            6'd16: cur_byte = l_pos[0][31:24];
-            6'd17: cur_byte = l_pos[0][23:16];
-            6'd18: cur_byte = l_pos[0][15:8];
-            6'd19: cur_byte = l_pos[0][7:0];
-            6'd20: cur_byte = l_pnl[0][31:24];
-            6'd21: cur_byte = l_pnl[0][23:16];
-            6'd22: cur_byte = l_pnl[0][15:8];
-            6'd23: cur_byte = l_pnl[0][7:0];
-            6'd24: cur_byte = l_rej[0];
-            6'd25: cur_byte = l_tok[0];
-            6'd26: cur_byte = {6'b0, l_av[0], l_bv[0]};
-            6'd27: cur_byte = 8'h00;
+            7'd16: cur_byte = l_pos[0][31:24];
+            7'd17: cur_byte = l_pos[0][23:16];
+            7'd18: cur_byte = l_pos[0][15:8];
+            7'd19: cur_byte = l_pos[0][7:0];
+            7'd20: cur_byte = l_pnl[0][31:24];
+            7'd21: cur_byte = l_pnl[0][23:16];
+            7'd22: cur_byte = l_pnl[0][15:8];
+            7'd23: cur_byte = l_pnl[0][7:0];
+            7'd24: cur_byte = l_rej[0];
+            7'd25: cur_byte = l_tok[0];
+            7'd26: cur_byte = {6'b0, l_av[0], l_bv[0]};
+            7'd27: cur_byte = 8'h00;
             // Slot 1 (bytes 28-39)
-            6'd28: cur_byte = l_pos[1][31:24];
-            6'd29: cur_byte = l_pos[1][23:16];
-            6'd30: cur_byte = l_pos[1][15:8];
-            6'd31: cur_byte = l_pos[1][7:0];
-            6'd32: cur_byte = l_pnl[1][31:24];
-            6'd33: cur_byte = l_pnl[1][23:16];
-            6'd34: cur_byte = l_pnl[1][15:8];
-            6'd35: cur_byte = l_pnl[1][7:0];
-            6'd36: cur_byte = l_rej[1];
-            6'd37: cur_byte = l_tok[1];
-            6'd38: cur_byte = {6'b0, l_av[1], l_bv[1]};
-            6'd39: cur_byte = 8'h00;
+            7'd28: cur_byte = l_pos[1][31:24];
+            7'd29: cur_byte = l_pos[1][23:16];
+            7'd30: cur_byte = l_pos[1][15:8];
+            7'd31: cur_byte = l_pos[1][7:0];
+            7'd32: cur_byte = l_pnl[1][31:24];
+            7'd33: cur_byte = l_pnl[1][23:16];
+            7'd34: cur_byte = l_pnl[1][15:8];
+            7'd35: cur_byte = l_pnl[1][7:0];
+            7'd36: cur_byte = l_rej[1];
+            7'd37: cur_byte = l_tok[1];
+            7'd38: cur_byte = {6'b0, l_av[1], l_bv[1]};
+            7'd39: cur_byte = 8'h00;
             // Slot 2 (bytes 40-51)
-            6'd40: cur_byte = l_pos[2][31:24];
-            6'd41: cur_byte = l_pos[2][23:16];
-            6'd42: cur_byte = l_pos[2][15:8];
-            6'd43: cur_byte = l_pos[2][7:0];
-            6'd44: cur_byte = l_pnl[2][31:24];
-            6'd45: cur_byte = l_pnl[2][23:16];
-            6'd46: cur_byte = l_pnl[2][15:8];
-            6'd47: cur_byte = l_pnl[2][7:0];
-            6'd48: cur_byte = l_rej[2];
-            6'd49: cur_byte = l_tok[2];
-            6'd50: cur_byte = {6'b0, l_av[2], l_bv[2]};
-            6'd51: cur_byte = 8'h00;
+            7'd40: cur_byte = l_pos[2][31:24];
+            7'd41: cur_byte = l_pos[2][23:16];
+            7'd42: cur_byte = l_pos[2][15:8];
+            7'd43: cur_byte = l_pos[2][7:0];
+            7'd44: cur_byte = l_pnl[2][31:24];
+            7'd45: cur_byte = l_pnl[2][23:16];
+            7'd46: cur_byte = l_pnl[2][15:8];
+            7'd47: cur_byte = l_pnl[2][7:0];
+            7'd48: cur_byte = l_rej[2];
+            7'd49: cur_byte = l_tok[2];
+            7'd50: cur_byte = {6'b0, l_av[2], l_bv[2]};
+            7'd51: cur_byte = 8'h00;
             // Slot 3 (bytes 52-63)
-            6'd52: cur_byte = l_pos[3][31:24];
-            6'd53: cur_byte = l_pos[3][23:16];
-            6'd54: cur_byte = l_pos[3][15:8];
-            6'd55: cur_byte = l_pos[3][7:0];
-            6'd56: cur_byte = l_pnl[3][31:24];
-            6'd57: cur_byte = l_pnl[3][23:16];
-            6'd58: cur_byte = l_pnl[3][15:8];
-            6'd59: cur_byte = l_pnl[3][7:0];
-            6'd60: cur_byte = l_rej[3];
-            6'd61: cur_byte = l_tok[3];
-            6'd62: cur_byte = {6'b0, l_av[3], l_bv[3]};
-            6'd63: cur_byte = 8'h00;
+            7'd52: cur_byte = l_pos[3][31:24];
+            7'd53: cur_byte = l_pos[3][23:16];
+            7'd54: cur_byte = l_pos[3][15:8];
+            7'd55: cur_byte = l_pos[3][7:0];
+            7'd56: cur_byte = l_pnl[3][31:24];
+            7'd57: cur_byte = l_pnl[3][23:16];
+            7'd58: cur_byte = l_pnl[3][15:8];
+            7'd59: cur_byte = l_pnl[3][7:0];
+            7'd60: cur_byte = l_rej[3];
+            7'd61: cur_byte = l_tok[3];
+            7'd62: cur_byte = {6'b0, l_av[3], l_bv[3]};
+            7'd63: cur_byte = 8'h00;
+            // Latency stats (bytes 64-79)
+            7'd64: cur_byte = l_lat_min[31:24];
+            7'd65: cur_byte = l_lat_min[23:16];
+            7'd66: cur_byte = l_lat_min[15:8];
+            7'd67: cur_byte = l_lat_min[7:0];
+            7'd68: cur_byte = l_lat_max[31:24];
+            7'd69: cur_byte = l_lat_max[23:16];
+            7'd70: cur_byte = l_lat_max[15:8];
+            7'd71: cur_byte = l_lat_max[7:0];
+            7'd72: cur_byte = l_lat_last[31:24];
+            7'd73: cur_byte = l_lat_last[23:16];
+            7'd74: cur_byte = l_lat_last[15:8];
+            7'd75: cur_byte = l_lat_last[7:0];
+            7'd76: cur_byte = l_lat_count[31:24];
+            7'd77: cur_byte = l_lat_count[23:16];
+            7'd78: cur_byte = l_lat_count[15:8];
+            7'd79: cur_byte = l_lat_count[7:0];
             default: cur_byte = 8'h00;
         endcase
     end
@@ -188,7 +220,11 @@ module telemetry_tx
             state    <= IDLE;
             byte_idx <= '0;
             seq_num  <= '0;
-            l_oid    <= '0;
+            l_oid       <= '0;
+            l_lat_min   <= '0;
+            l_lat_max   <= '0;
+            l_lat_last  <= '0;
+            l_lat_count <= '0;
             for (int i = 0; i < N_BOOKS; i++) begin
                 l_pos[i] <= '0;
                 l_pnl[i] <= '0;
@@ -210,7 +246,11 @@ module telemetry_tx
                             l_bv[i]  <= bid_valid[i];
                             l_av[i]  <= ask_valid[i];
                         end
-                        l_oid    <= order_id_cnt;
+                        l_oid       <= order_id_cnt;
+                        l_lat_min   <= lat_min;
+                        l_lat_max   <= lat_max;
+                        l_lat_last  <= lat_last;
+                        l_lat_count <= lat_count;
                         seq_num  <= seq_num + 32'h1;
                         state    <= SEND;
                         byte_idx <= '0;

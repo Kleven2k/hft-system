@@ -20,7 +20,7 @@
 //   8 × RAMB18 (256×32), ~80 LUTs control logic per instance
 // ============================================================
 `timescale 1ns/1ps
-module order_book
+(* keep_hierarchy = "yes" *) module order_book
     import hft_pkg::*;
 #(
     parameter int MAX_LEVELS = 256

@@ -1,73 +1,96 @@
 // ============================================================
-// ouch_encoder.sv — OUCH order message AXI-Stream serializer
+// ouch_encoder.sv — OUCH 4.2 message serializer
 //
-// New order  ('O', 20 bytes):
-//   Byte  0   : msg_type = 0x4F ('O')
-//   Bytes 1-2 : symbol_id [15:0]  big-endian
-//   Byte  3   : side  0x42='B' / 0x53='S'
-//   Bytes 4-7 : price [31:0]      big-endian
-//   Bytes 8-11: quantity [31:0]   big-endian
-//   Bytes 12-19: order_id [63:0]  big-endian
+// Enter Order ('O', 49 bytes):
+//   [0]      'O' (0x4F)
+//   [1-14]   order_token  — 14-byte ASCII, order_id zero-padded left
+//   [15]     buy_sell     — 'B' (0x42) or 'S' (0x53)
+//   [16-19]  shares       — uint32 big-endian
+//   [20-25]  stock        — 6-byte ASCII, right-space-padded (from STOCK_n param)
+//   [26-29]  price        — uint32 big-endian ($0.0001 per unit)
+//   [30-33]  time_in_force— uint32 (99998 = IOC)
+//   [34-39]  firm         — 6-byte ASCII, right-space-padded (from FIRM param)
+//   [40]     display      — 'Y'
+//   [41]     capacity     — from CAPACITY param ('A' agency / 'P' principal)
+//   [42]     iso_eligible — 'N'
+//   [43-46]  min_qty      — uint32 (0 = no minimum)
+//   [47]     cross_type   — 'N'
+//   [48]     customer_type— ' '
 //
-// Cancel order ('X', 9 bytes):
-//   Byte  0   : msg_type = 0x58 ('X')
-//   Bytes 1-8 : order_id [63:0]   big-endian
+// Cancel Order ('X', 15 bytes):
+//   [0]      'X' (0x58)
+//   [1-14]   order_token  — same format as above
 //
-// UDP header timing constraint (eth_stack_wrapper.sv line 92):
-//   udp_tx_hdr_valid = udp_tx_tvalid && udp_tx_tlast
-//   → sideband signals (including tx_length) must be held stable
-//     from first byte through tlast.
-//
-// Clock domain: rgmii_rxc
+// Output: bare OUCH bytes as AXI-Stream (no SoupBinTCP framing — added above).
+// Clock domain: enc_clk (rgmii_rxc).
 // ============================================================
 `timescale 1ns/1ps
 module ouch_encoder
     import hft_pkg::*;
 #(
-    parameter bit [31:0] DST_IP   = OUCH_DST_IP,
-    parameter bit [47:0] DST_MAC  = GATEWAY_MAC,
-    parameter bit [15:0] DST_PORT = PORT_OUCH
+    // One 6-byte ASCII stock symbol per slot (right-space-padded).
+    // E.g. "AAPL  " → 8'h41,8'h41,8'h50,8'h4C,8'h20,8'h20
+    parameter [47:0] STOCK_0    = 48'h41_41_50_4C_20_20,  // "AAPL  "
+    parameter [47:0] STOCK_1    = 48'h4D_53_46_54_20_20,  // "MSFT  "
+    parameter [47:0] STOCK_2    = 48'h41_4D_5A_4E_20_20,  // "AMZN  "
+    parameter [47:0] STOCK_3    = 48'h54_53_4C_41_20_20,  // "TSLA  "
+    // 6-byte MPID / firm code
+    parameter [47:0] FIRM       = 48'h4D_59_46_52_4D_20,  // "MYFIRM"
+    // 1-byte capacity: 'A' agency (0x41) or 'P' principal (0x50)
+    parameter [7:0]  CAPACITY   = 8'h41,                  // 'A'
+    // Time-in-force: 99998 = IOC
+    parameter [31:0] TIF        = 32'd99998
 )(
-    input  logic        clk,   // rgmii_rxc domain
-    input  logic        rst,   // active-high synchronous
+    input  logic        clk,
+    input  logic        rst,
 
-    // Order input (one-cycle pulse from order_cdc_bridge)
+    // Order input (one-cycle pulse)
     input  order_t      order_in,
     input  logic        order_valid,
 
-    // UDP TX AXI-Stream
+    // OUCH bytes output (no SoupBinTCP header — added by soup_session)
     output logic [7:0]  tx_tdata,
     output logic        tx_tvalid,
     input  logic        tx_tready,
-    output logic        tx_tlast,
-    output logic        tx_tuser,
-
-    // UDP sideband (held stable during entire packet)
-    output logic [47:0] tx_dst_mac,
-    output logic [31:0] tx_dst_ip,
-    output logic [15:0] tx_src_port,
-    output logic [15:0] tx_dst_port,
-    output logic [15:0] tx_length
+    output logic        tx_tlast
 );
 
-    // Fixed sideband — stable always
-    assign tx_dst_mac  = DST_MAC;
-    assign tx_dst_ip   = DST_IP;
-    assign tx_src_port = PORT_OUCH;
-    assign tx_dst_port = DST_PORT;
-    assign tx_tuser    = 1'b0;
+    // Stock symbol lookup by symbol_id[1:0]
+    function automatic [47:0] stock_sym(input logic [1:0] sid);
+        case (sid)
+            2'd0: return STOCK_0;
+            2'd1: return STOCK_1;
+            2'd2: return STOCK_2;
+            2'd3: return STOCK_3;
+        endcase
+    endfunction
 
-    // 20-byte shift register: MSB is the current output byte.
-    // Cancel uses only bytes 0-8; new order uses all 20.
-    logic [159:0] shift_reg;
-    logic [4:0]   byte_cnt;
+    // Convert 64-bit order_id to 14-byte ASCII hex token (MSB first).
+    // Hex avoids division/modulo — just nibble extraction + ASCII offset.
+    // 14 hex chars cover 56 bits (up to 0xFFFFFFFFFFFFFF ≈ 72 quadrillion orders).
+    // order_id[55:0] is used; upper 8 bits are ignored (counter never reaches 2^56).
+    function automatic [111:0] make_token(input logic [63:0] oid);
+        logic [111:0] t;
+        logic [3:0]   nibble;
+        for (int i = 0; i < 14; i++) begin
+            nibble = oid[(13-i)*4 +: 4];
+            t[i*8 +: 8] = (nibble < 4'd10) ? (8'h30 + {4'h0, nibble})
+                                            : (8'h41 + {4'h0, nibble} - 8'd10);
+        end
+        return t;
+    endfunction
+
+    // ---- Shift register ----
+    // Max frame: 49 bytes (Enter Order). Store as 392-bit SR.
+    // MSB of SR is always the next output byte.
+    logic [391:0] shift_reg;  // 49 × 8 bits
+    logic [5:0]   byte_cnt;
     logic         tx_active;
-    logic [4:0]   pkt_last;   // index of final byte (8 or 19)
+    logic [5:0]   pkt_last;
 
-    assign tx_tdata  = shift_reg[159:152];
+    assign tx_tdata  = shift_reg[391:384];
     assign tx_tvalid = tx_active;
     assign tx_tlast  = tx_active && (byte_cnt == pkt_last);
-    assign tx_length = (pkt_last == 5'd8) ? 16'd9 : 16'd20;
 
     always_ff @(posedge clk) begin
         if (rst) begin
@@ -78,57 +101,52 @@ module ouch_encoder
         end else if (!tx_active) begin
             if (order_valid) begin
                 if (order_in.cancel) begin
-                    // ---- Cancel: 9 bytes ----
-                    shift_reg <= {
-                        8'h58,                       // byte 0: 'X'
-                        order_in.order_id[63:56],    // byte 1
-                        order_in.order_id[55:48],    // byte 2
-                        order_in.order_id[47:40],    // byte 3
-                        order_in.order_id[39:32],    // byte 4
-                        order_in.order_id[31:24],    // byte 5
-                        order_in.order_id[23:16],    // byte 6
-                        order_in.order_id[15:8],     // byte 7
-                        order_in.order_id[7:0],      // byte 8
-                        88'h0                        // padding (not sent)
+                    // ---- Cancel: 15 bytes ----
+                    shift_reg[391:272] <= {
+                        8'h58,                          // 'X'
+                        make_token(order_in.order_id)   // [1-14] token
                     };
-                    pkt_last  <= 5'd8;
+                    shift_reg[271:0]   <= '0;
+                    pkt_last  <= 6'd14;
                 end else begin
-                    // ---- New order: 20 bytes ----
+                    // ---- Enter Order: 49 bytes ----
                     shift_reg <= {
-                        8'h4F,                                                    // byte 0
-                        order_in.symbol_id[15:8],                                 // byte 1
-                        order_in.symbol_id[7:0],                                  // byte 2
-                        (order_in.side == ORD_BUY) ? 8'h42 : 8'h53,              // byte 3
-                        order_in.price[31:24],                                    // byte 4
-                        order_in.price[23:16],                                    // byte 5
-                        order_in.price[15:8],                                     // byte 6
-                        order_in.price[7:0],                                      // byte 7
-                        order_in.quantity[31:24],                                 // byte 8
-                        order_in.quantity[23:16],                                 // byte 9
-                        order_in.quantity[15:8],                                  // byte 10
-                        order_in.quantity[7:0],                                   // byte 11
-                        order_in.order_id[63:56],                                 // byte 12
-                        order_in.order_id[55:48],                                 // byte 13
-                        order_in.order_id[47:40],                                 // byte 14
-                        order_in.order_id[39:32],                                 // byte 15
-                        order_in.order_id[31:24],                                 // byte 16
-                        order_in.order_id[23:16],                                 // byte 17
-                        order_in.order_id[15:8],                                  // byte 18
-                        order_in.order_id[7:0]                                    // byte 19
+                        8'h4F,                                          // [0]  'O'
+                        make_token(order_in.order_id),                  // [1-14] token
+                        (order_in.side == ORD_BUY) ? 8'h42 : 8'h53,   // [15] B/S
+                        order_in.quantity[31:24],                       // [16]
+                        order_in.quantity[23:16],                       // [17]
+                        order_in.quantity[15:8],                        // [18]
+                        order_in.quantity[7:0],                         // [19]
+                        stock_sym(order_in.symbol_id[1:0]),             // [20-25]
+                        order_in.price[31:24],                          // [26]
+                        order_in.price[23:16],                          // [27]
+                        order_in.price[15:8],                           // [28]
+                        order_in.price[7:0],                            // [29]
+                        TIF[31:24],                                     // [30]
+                        TIF[23:16],                                     // [31]
+                        TIF[15:8],                                      // [32]
+                        TIF[7:0],                                       // [33]
+                        FIRM,                                           // [34-39]
+                        8'h59,                                          // [40] 'Y' display
+                        CAPACITY,                                       // [41] capacity
+                        8'h4E,                                          // [42] 'N' ISO
+                        32'd0,                                          // [43-46] min_qty=0
+                        8'h4E,                                          // [47] 'N' cross_type
+                        8'h20                                           // [48] ' ' customer
                     };
-                    pkt_last  <= 5'd19;
+                    pkt_last  <= 6'd48;
                 end
-                byte_cnt  <= 5'd0;
+                byte_cnt  <= 6'd0;
                 tx_active <= 1'b1;
             end
         end else begin
-            // Streaming — stall if downstream not ready
             if (tx_tready) begin
                 if (byte_cnt == pkt_last) begin
                     tx_active <= 1'b0;
                 end else begin
-                    shift_reg <= {shift_reg[151:0], 8'h00};
-                    byte_cnt  <= byte_cnt + 5'd1;
+                    shift_reg <= {shift_reg[383:0], 8'h00};
+                    byte_cnt  <= byte_cnt + 6'd1;
                 end
             end
         end

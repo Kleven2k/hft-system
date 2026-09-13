@@ -127,9 +127,17 @@ module itch_msg_bridge
             case (rstate)
                 R_IDLE: begin
                     if (!fifo_empty_raw) begin
-                        fifo_rden <= '1;                    // advance pointer next cycle
-                        r_quote   <= decode_quote(fifo_rdata); // capture NOW (combinational)
-                        rstate    <= R_OUTPUT;
+                        fifo_rden         <= '1;            // advance pointer next cycle
+                        // Inline decode: avoids Icarus packed-struct function-return-value
+                        // bug where r_quote <= decode_quote(...) zeroes non-valid fields.
+                        r_quote.valid     <= 1'b1;
+                        r_quote.op        <= op_t'(fifo_rdata[146:145]);
+                        r_quote.is_bid    <= fifo_rdata[144];
+                        r_quote.timestamp <= fifo_rdata[143:80];
+                        r_quote.price     <= fifo_rdata[79:48];
+                        r_quote.shares    <= fifo_rdata[47:16];
+                        r_quote.symbol_id <= fifo_rdata[15:0];
+                        rstate            <= R_OUTPUT;
                     end
                 end
 

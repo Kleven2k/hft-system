@@ -13,9 +13,10 @@
 //            parameters forwarded.
 // Phase 17 — Inventory skew: SKEW_SHIFT parameter forwarded.
 // Phase 20 — Telemetry: telemetry_tx (clk domain) →
-//            axis_async_fifo (CDC) → 2:1 AXI arbiter →
-//            udp_tx. OUCH encoder has priority; telemetry
-//            sends once per second on PORT_TELEM (42002).
+//            axis_async_fifo (CDC) → udp_tx (telemetry only).
+// Phase 27 — OUCH 4.2: ouch_encoder output exposed as ouch_tx_*
+//            ports (no longer goes to UDP). soup_session wraps
+//            OUCH bytes in SoupBinTCP and forwards to tcp_engine.
 // ============================================================
 `timescale 1ns/1ps
 module order_engine
@@ -30,7 +31,17 @@ module order_engine
     parameter int FAT_FINGER_BPS = 500,
     parameter int MAX_BURST         = 5,
     parameter int REFILL_PERIOD     = 12_500_000,
-    parameter int SPREAD_EMA_SHIFT  = 4
+    parameter int SPREAD_EMA_SHIFT  = 4,
+    parameter int QUOTE_OFFSET      = 3,          // power-on default per slot
+    parameter int STALE_MULT        = 3,          // stale_thresh = quote_offset × STALE_MULT
+    parameter int TIMEOUT_CYC       = 1_250_000_000,  // 10 s safety timeout
+    // OUCH 4.2 stock symbols (6-byte ASCII per slot)
+    parameter [47:0] STOCK_0    = 48'h41_41_50_4C_20_20,  // "AAPL  "
+    parameter [47:0] STOCK_1    = 48'h4D_53_46_54_20_20,  // "MSFT  "
+    parameter [47:0] STOCK_2    = 48'h41_4D_5A_4E_20_20,  // "AMZN  "
+    parameter [47:0] STOCK_3    = 48'h54_53_4C_41_20_20,  // "TSLA  "
+    parameter [47:0] FIRM       = 48'h4D_59_46_52_4D_20,  // "MYFIRM"
+    parameter [7:0]  CAPACITY   = 8'h41                   // 'A' agency
 )(
     // ---- Strategy clock domain --------------------------------
     input  logic        clk,
@@ -45,6 +56,9 @@ module order_engine
     input  logic        bid_valid      [0:N_BOOKS-1],
     input  logic        ask_valid      [0:N_BOOKS-1],
 
+    // Per-slot quote offset (UART-configurable)
+    input  logic [31:0] quote_offset   [0:N_BOOKS-1],
+
     // Pre-trade risk
     input  logic        kill_switch,
 
@@ -52,7 +66,13 @@ module order_engine
     input  logic        enc_clk,
     input  logic        enc_rst_n,
 
-    // UDP TX AXI-Stream (rgmii_rxc domain)
+    // OUCH 4.2 AXI-Stream output (enc_clk domain) → soup_session → tcp_engine
+    output logic [7:0]  ouch_tx_tdata,
+    output logic        ouch_tx_tvalid,
+    input  logic        ouch_tx_tready,
+    output logic        ouch_tx_tlast,
+
+    // UDP TX AXI-Stream — telemetry only (rgmii_rxc domain)
     output logic [7:0]  udp_tx_tdata,
     output logic        udp_tx_tvalid,
     input  logic        udp_tx_tready,
@@ -72,8 +92,17 @@ module order_engine
     input  logic [7:0]  ack_raw_status,
     input  logic [31:0] ack_raw_fill_qty,
 
+    // Phase 25 — latency stats from latency_monitor (clk domain)
+    input  logic [31:0] lat_min,
+    input  logic [31:0] lat_max,
+    input  logic [31:0] lat_last,
+    input  logic [31:0] lat_count,
+
     // Debug
-    output logic [15:0] drop_count
+    output logic [15:0] drop_count,
+
+    // Phase 25 — latency measurement pulse (clk domain)
+    output logic        order_sent    // 1-cycle pulse when strategy emits an order
 );
 
     // ---- ACK toggle CDC (rgmii_rxc → clk) --------------------
@@ -125,6 +154,9 @@ module order_engine
     order_t strat_order;
     logic   strat_valid;
 
+    // Phase 25 — expose strat_valid as order_sent pulse
+    assign order_sent = strat_valid;
+
     logic signed [31:0] strat_position   [0:N_BOOKS-1];
     logic signed [31:0] strat_pnl        [0:N_BOOKS-1];
     logic        [7:0]  strat_reject_cnt [0:N_BOOKS-1];
@@ -139,11 +171,13 @@ module order_engine
         .ORDER_QTY     (ORDER_QTY),
         .MAX_POSITION  (MAX_POSITION),
         .COOLDOWN_CYC  (COOLDOWN_CYC),
+        .TIMEOUT_CYC   (TIMEOUT_CYC),
         .SKEW_SHIFT    (SKEW_SHIFT),
         .FAT_FINGER_BPS  (FAT_FINGER_BPS),
         .MAX_BURST       (MAX_BURST),
         .REFILL_PERIOD   (REFILL_PERIOD),
-        .SPREAD_EMA_SHIFT(SPREAD_EMA_SHIFT)
+        .SPREAD_EMA_SHIFT(SPREAD_EMA_SHIFT),
+        .STALE_MULT      (STALE_MULT)
     ) u_strategy (
         .clk              (clk),
         .rst              (rst),
@@ -153,6 +187,7 @@ module order_engine
         .spread           (spread),
         .bid_valid        (bid_valid),
         .ask_valid        (ask_valid),
+        .quote_offset     (quote_offset),
         .kill_switch      (kill_switch),
         .ack_valid        (strat_ack_valid),
         .ack_order_id     (strat_ack_order_id),
@@ -188,31 +223,23 @@ module order_engine
         .fifo_full_rclk()
     );
 
-    // ---- OUCH encoder (rgmii_rxc domain) ----------------------
-    logic [7:0]  ouch_tdata;
-    logic        ouch_tvalid;
-    logic        ouch_tready;
-    logic        ouch_tlast;
-    logic        ouch_tuser;
-    logic [47:0] ouch_dst_mac;
-    logic [31:0] ouch_dst_ip;
-    logic [15:0] ouch_src_port, ouch_dst_port, ouch_length;
-
-    ouch_encoder u_encoder (
+    // ---- OUCH 4.2 encoder (rgmii_rxc domain) → ouch_tx_* ports ----
+    ouch_encoder #(
+        .STOCK_0  (STOCK_0),
+        .STOCK_1  (STOCK_1),
+        .STOCK_2  (STOCK_2),
+        .STOCK_3  (STOCK_3),
+        .FIRM     (FIRM),
+        .CAPACITY (CAPACITY)
+    ) u_encoder (
         .clk         (enc_clk),
         .rst         (~enc_rst_n),
         .order_in    (enc_order),
         .order_valid (enc_order_valid),
-        .tx_tdata    (ouch_tdata),
-        .tx_tvalid   (ouch_tvalid),
-        .tx_tready   (ouch_tready),
-        .tx_tlast    (ouch_tlast),
-        .tx_tuser    (ouch_tuser),
-        .tx_dst_mac  (ouch_dst_mac),
-        .tx_dst_ip   (ouch_dst_ip),
-        .tx_src_port (ouch_src_port),
-        .tx_dst_port (ouch_dst_port),
-        .tx_length   (ouch_length)
+        .tx_tdata    (ouch_tx_tdata),
+        .tx_tvalid   (ouch_tx_tvalid),
+        .tx_tready   (ouch_tx_tready),
+        .tx_tlast    (ouch_tx_tlast)
     );
 
     // ---- Telemetry TX (clk domain) ----------------------------
@@ -234,6 +261,10 @@ module order_engine
         .bid_valid   (strat_bid_valid),
         .ask_valid   (strat_ask_valid),
         .order_id_cnt(strat_order_id_cnt),
+        .lat_min     (lat_min),
+        .lat_max     (lat_max),
+        .lat_last    (lat_last),
+        .lat_count   (lat_count),
         .tx_tdata    (telem_tdata_clk),
         .tx_tvalid   (telem_tvalid_clk),
         .tx_tready   (telem_tready_clk),
@@ -299,69 +330,17 @@ module order_engine
         .m_status_good_frame ()
     );
 
-    // ---- 2:1 AXI-Stream arbiter (enc_clk domain) --------------
-    // OUCH encoder has priority. Telemetry only starts when OUCH
-    // is idle. Once a packet starts, it completes without switching.
-    // A 48-byte telemetry packet takes 48 cycles (384 ns) — negligible
-    // latency for OUCH orders gated by 100 ms cooldown.
-    typedef enum logic [1:0] { ARB_IDLE, ARB_OUCH, ARB_TELEM } arb_state_t;
-    arb_state_t arb_state;
-
-    always_ff @(posedge enc_clk or negedge enc_rst_n) begin
-        if (!enc_rst_n)
-            arb_state <= ARB_IDLE;
-        else case (arb_state)
-            ARB_IDLE: begin
-                if      (ouch_tvalid)  arb_state <= ARB_OUCH;
-                else if (telem_tvalid_enc) arb_state <= ARB_TELEM;
-            end
-            ARB_OUCH:  if (ouch_tvalid  && ouch_tlast  && udp_tx_tready)
-                            arb_state <= ARB_IDLE;
-            ARB_TELEM: if (telem_tvalid_enc && telem_tlast_enc && udp_tx_tready)
-                            arb_state <= ARB_IDLE;
-            default:   arb_state <= ARB_IDLE;
-        endcase
-    end
-
-    assign ouch_tready      = (arb_state == ARB_OUCH)  ? udp_tx_tready : 1'b0;
-    assign telem_tready_enc = (arb_state == ARB_TELEM) ? udp_tx_tready : 1'b0;
-
-    always_comb begin
-        case (arb_state)
-            ARB_OUCH: begin
-                udp_tx_tdata    = ouch_tdata;
-                udp_tx_tvalid   = ouch_tvalid;
-                udp_tx_tlast    = ouch_tlast;
-                udp_tx_tuser    = ouch_tuser;
-                udp_tx_dst_mac  = ouch_dst_mac;
-                udp_tx_dst_ip   = ouch_dst_ip;
-                udp_tx_src_port = ouch_src_port;
-                udp_tx_dst_port = ouch_dst_port;
-                udp_tx_length   = ouch_length;
-            end
-            ARB_TELEM: begin
-                udp_tx_tdata    = telem_tdata_enc;
-                udp_tx_tvalid   = telem_tvalid_enc;
-                udp_tx_tlast    = telem_tlast_enc;
-                udp_tx_tuser    = 1'b0;
-                udp_tx_dst_mac  = GATEWAY_MAC;
-                udp_tx_dst_ip   = OUCH_DST_IP;
-                udp_tx_src_port = PORT_OUCH;
-                udp_tx_dst_port = PORT_TELEM;
-                udp_tx_length   = 16'd64;
-            end
-            default: begin
-                udp_tx_tdata    = 8'h00;
-                udp_tx_tvalid   = 1'b0;
-                udp_tx_tlast    = 1'b0;
-                udp_tx_tuser    = 1'b0;
-                udp_tx_dst_mac  = '0;
-                udp_tx_dst_ip   = '0;
-                udp_tx_src_port = '0;
-                udp_tx_dst_port = '0;
-                udp_tx_length   = '0;
-            end
-        endcase
-    end
+    // ---- UDP TX: telemetry passthrough (enc_clk domain) -------
+    // OUCH orders now go to ouch_tx_* ports (→ soup_session → tcp_engine).
+    assign telem_tready_enc = udp_tx_tready;
+    assign udp_tx_tdata     = telem_tdata_enc;
+    assign udp_tx_tvalid    = telem_tvalid_enc;
+    assign udp_tx_tlast     = telem_tlast_enc;
+    assign udp_tx_tuser     = 1'b0;
+    assign udp_tx_dst_mac   = GATEWAY_MAC;
+    assign udp_tx_dst_ip    = OUCH_DST_IP;
+    assign udp_tx_src_port  = PORT_OUCH;
+    assign udp_tx_dst_port  = PORT_TELEM;
+    assign udp_tx_length    = 16'd80;   // Phase 25: 80-byte telemetry frame
 
 endmodule

@@ -58,6 +58,8 @@ module strategy
     parameter int COOLDOWN_CYC   = 12_500_000,  // 100 ms @ 125 MHz
     parameter int TIMEOUT_CYC    = COOLDOWN_CYC, // auto-cancel if no ACK
     parameter int SKEW_SHIFT     = 31,           // inv_skew = position>>>SKEW_SHIFT; 31=off
+    parameter int QUOTE_OFFSET   = 1,            // power-on default (overridden via UART at runtime)
+    parameter int STALE_MULT     = 2,            // stale_thresh = quote_offset × STALE_MULT
     parameter int FAT_FINGER_BPS = 500,          // 5 % max price deviation
     parameter int MAX_BURST         = 5,            // token bucket depth
     parameter int REFILL_PERIOD     = 12_500_000,   // 10 orders/s @ 125 MHz
@@ -73,6 +75,9 @@ module strategy
     input  logic [31:0] spread         [0:N_BOOKS-1],
     input  logic        bid_valid      [0:N_BOOKS-1],
     input  logic        ask_valid      [0:N_BOOKS-1],
+
+    // Per-slot quote offset (UART-configurable, replaces QUOTE_OFFSET/STALE_THRESH params)
+    input  logic [31:0] quote_offset   [0:N_BOOKS-1],
 
     // Pre-trade risk (Phase 16)
     input  logic        kill_switch,   // 1 = halt all new orders
@@ -138,31 +143,39 @@ module strategy
     logic        bid_v_r  [0:N_BOOKS-1];
     logic        ask_v_r  [0:N_BOOKS-1];
 
-    // ---- Stale detection: registered per-book (timing fix) --
-    // is_stale compares bid/ask vs quoted_price (32-bit CARRY4 chains) and
-    // timeout_cnt==0 (wide counter compare) — all indexed by rr_idx.
-    // Pre-registering per-book removes those CARRY4 chains from the path;
-    // is_stale in slot_eval becomes a 1-LUT AND/OR of 1-bit registered inputs.
-    logic               bid_stale_r   [0:N_BOOKS-1]; // bid_p_r[i] != quoted_price[i]
-    logic               ask_stale_r   [0:N_BOOKS-1]; // ask_p_r[i] != quoted_price[i]
+    // ---- Stale detection: three-stage pipeline --------------------------------
+    // stale_thresh = quote_offset × STALE_MULT so orders survive long enough
+    // to fill (fill needs offset+1 ticks; stale fires at stale_thresh ticks).
+    // Three stages keep each stage under ~8 levels:
+    //   Stage 0: stale_thresh_r = quote_offset × STALE_MULT  (~8 levels → FF)
+    //   Stage 1: bid_abs_diff_r = abs(quoted_price - bid_p_r) (~10 levels → FF)
+    //   Stage 2: bid_stale_r    = bid_abs_diff_r > stale_thresh_r (~6 levels → FF)
+    logic        [31:0] stale_thresh_r [0:N_BOOKS-1];  // stage 0: quote_offset × STALE_MULT
+    logic        [31:0] bid_abs_diff_r [0:N_BOOKS-1];  // stage 1: abs price diff
+    logic        [31:0] ask_abs_diff_r [0:N_BOOKS-1];  // stage 1: abs price diff
+    logic               bid_stale_r   [0:N_BOOKS-1]; // |bid_p_r[i] - quoted_price[i]| > stale_thresh_r
+    logic               ask_stale_r   [0:N_BOOKS-1]; // |ask_p_r[i] - quoted_price[i]| > stale_thresh_r
     logic               timed_out_r   [0:N_BOOKS-1]; // timeout_cnt[i] == 0
 
     // ---- Combinational signals (indexed by rr_idx) ----------
     logic               is_stale;
 
-    // ---- Inventory skew: per-book registered (Phase 23 timing fix) ----------
-    // Inline rr_idx-muxed subtract was the critical path:
-    //   rr_idx (fanout=178) → position/bid_p_r mux → 32-bit subtract (6×CARRY4)
-    //   → order_out.price  (12 levels, −1.9 ns WNS).
-    // Computing per-book (all i each cycle) and registering breaks that path:
-    // slot_eval reads skewed_bid_r[rr_idx] — one FF output through a 4:1 mux.
-    logic signed [31:0] skew_c       [0:N_BOOKS-1];
-    logic signed [31:0] raw_bid_c    [0:N_BOOKS-1];
-    logic signed [31:0] raw_ask_c    [0:N_BOOKS-1];
-    logic        [31:0] skewed_bid_c [0:N_BOOKS-1];
-    logic        [31:0] skewed_ask_c [0:N_BOOKS-1];
-    logic        [31:0] skewed_bid_r [0:N_BOOKS-1];  // registered, used in slot_eval
-    logic        [31:0] skewed_ask_r [0:N_BOOKS-1];  // registered, used in slot_eval
+    // ---- Inventory skew: two-stage pipeline (Phase 25 timing fix) -----------
+    // Replacing QUOTE_OFFSET compile-time constant with runtime quote_offset[i]
+    // added a second serial 32-bit subtract on the critical path:
+    //   bid_p_r → subtract_skew → subtract_offset → skewed_bid_r  (~16 LUT levels)
+    // Fix: split into two registered stages:
+    //   Stage 1: bid_minus_skew_r = bid_p_r - skew  (~8 levels → FF)
+    //   Stage 2: raw_bid_c = bid_minus_skew_r - quote_offset[i] (~8 levels → FF)
+    logic signed [31:0] skew_c            [0:N_BOOKS-1];
+    logic signed [31:0] bid_minus_skew_r  [0:N_BOOKS-1];  // stage 1 registered
+    logic signed [31:0] ask_minus_skew_r  [0:N_BOOKS-1];  // stage 1 registered
+    logic signed [31:0] raw_bid_c         [0:N_BOOKS-1];
+    logic signed [31:0] raw_ask_c         [0:N_BOOKS-1];
+    logic        [31:0] skewed_bid_c      [0:N_BOOKS-1];
+    logic        [31:0] skewed_ask_c      [0:N_BOOKS-1];
+    logic        [31:0] skewed_bid_r      [0:N_BOOKS-1];  // registered, used in slot_eval
+    logic        [31:0] skewed_ask_r      [0:N_BOOKS-1];  // registered, used in slot_eval
 
     // ---- Fat-finger: computed for all books, registered next cycle ----------
     // Simplified form: |diff| * FF_FACTOR ≤ mid  (FF_FACTOR = 10000/BPS = 20)
@@ -193,8 +206,9 @@ module strategy
     // fat_finger_r / ema_ok_r).  1-cycle latency is safe: cooldown prevents
     // re-entry for 12.5 M cycles after any order fires.
     logic               tok_ok_r      [0:N_BOOKS-1]; // token_cnt[i] > 0
-    logic               pos_ok_buy_r  [0:N_BOOKS-1]; // position[i] < MAX_POSITION
-    logic               pos_ok_sell_r [0:N_BOOKS-1]; // position[i] > -MAX_POSITION
+    logic               pos_ok_buy_r  [0:N_BOOKS-1]; // position[i] <= 0 (flat or short → allow buy)
+    logic               pos_ok_sell_r [0:N_BOOKS-1]; // position[i] >= 0 (flat or long  → allow sell)
+    logic               cooldown_ok_r [0:N_BOOKS-1]; // cooldown[i] == 0
 
 
     always_comb begin
@@ -213,14 +227,16 @@ module strategy
             fat_finger_c[i]  = (mid_p_r[i] != 0) &&
                                 (37'(ff_bid_diff_r[i]) * 37'(FF_FACTOR) <= 37'(mid_p_r[i])) &&
                                 (37'(ff_ask_diff_r[i]) * 37'(FF_FACTOR) <= 37'(mid_p_r[i]));
-            // EMA spread filter: passes when spread_r is within SPREAD_MAX
-            // and within 1.5× the EMA (both inputs already registered).
-            ema_ok_c[i] = (spread_r[i] <= 32'(SPREAD_MAX)) &&
-                          (spread_r[i] <= spread_ema[i] + (spread_ema[i] >> 1));
-            // Inventory-skewed prices — all inputs registered, no rr_idx mux here.
-            skew_c[i]       = position[i] >>> SKEW_SHIFT;
-            raw_bid_c[i]    = $signed(bid_p_r[i]) - skew_c[i];
-            raw_ask_c[i]    = $signed(ask_p_r[i]) - skew_c[i];
+            // Spread filter: passes when spread_r is within SPREAD_MAX.
+            // Removed adaptive EMA component — 1.5×EMA was blocking all slots
+            // whenever spread briefly widened (EMA alpha=1/16 too slow to recover).
+            ema_ok_c[i] = (spread_r[i] <= 32'(SPREAD_MAX));
+            // Inventory-skewed prices — two-stage pipeline.
+            // Stage 1 (→ bid_minus_skew_r) is computed in always_ff below.
+            // Stage 2: subtract/add runtime quote_offset from pre-registered intermediate.
+            skew_c[i]       = position[i] >>> SKEW_SHIFT;  // for stage-1 FF in always_ff
+            raw_bid_c[i]    = bid_minus_skew_r[i] - $signed(quote_offset[i]);
+            raw_ask_c[i]    = ask_minus_skew_r[i] + $signed(quote_offset[i]);
             skewed_bid_c[i] = (raw_bid_c[i] < 32'sd1) ? 32'd1 : 32'(raw_bid_c[i]);
             skewed_ask_c[i] = (raw_ask_c[i] < 32'sd1) ? 32'd1 : 32'(raw_ask_c[i]);
         end
@@ -270,8 +286,14 @@ module strategy
                 risk_viol_cnt[i]  <= '0;
                 token_cnt[i]      <= TB_W'(MAX_BURST);  // full bucket at startup
                 tok_ok_r[i]       <= 1'b1;   // MAX_BURST > 0 at startup
+                cooldown_ok_r[i]  <= 1'b1;   // cooldown=0 at reset
                 pos_ok_buy_r[i]   <= 1'b1;   // position=0 < MAX_POSITION
                 pos_ok_sell_r[i]  <= 1'b1;   // position=0 > -MAX_POSITION
+                stale_thresh_r[i] <= 32'd0;
+                bid_abs_diff_r[i] <= 32'd0;
+                ask_abs_diff_r[i] <= 32'd0;
+                bid_minus_skew_r[i] <= 32'sd0;
+                ask_minus_skew_r[i] <= 32'sd0;
                 bid_stale_r[i]    <= 1'b0;
                 ask_stale_r[i]    <= 1'b0;
                 timed_out_r[i]    <= 1'b0;
@@ -295,10 +317,25 @@ module strategy
                 skewed_bid_r[i]   <= skewed_bid_c[i];
                 skewed_ask_r[i]   <= skewed_ask_c[i];
                 tok_ok_r[i]       <= (token_cnt[i] > 0);
-                pos_ok_buy_r[i]   <= (position[i] < $signed(32'(MAX_POSITION)));
-                pos_ok_sell_r[i]  <= (position[i] > $signed(-32'(MAX_POSITION)));
-                bid_stale_r[i]    <= (bid_p_r[i] != quoted_price[i]);
-                ask_stale_r[i]    <= (ask_p_r[i] != quoted_price[i]);
+                cooldown_ok_r[i]  <= (cooldown[i] == '0);
+                pos_ok_buy_r[i]   <= (position[i] <= $signed(32'(0)));  // flat or short
+                pos_ok_sell_r[i]  <= (position[i] >= $signed(32'(0)));  // flat or long
+                // Skewed price stage 1: bid/ask minus inventory skew → register.
+                // quote_offset subtracted in stage 2 (via raw_bid_c in always_comb).
+                bid_minus_skew_r[i] <= $signed(bid_p_r[i]) - skew_c[i];
+                ask_minus_skew_r[i] <= $signed(ask_p_r[i]) - skew_c[i];
+                // Stale stage 0: pre-register threshold = quote_offset × STALE_MULT.
+                stale_thresh_r[i] <= quote_offset[i] * 32'(STALE_MULT);
+                // Stale stage 1: abs(quoted_price - bid/ask) → register.
+                bid_abs_diff_r[i] <= ($signed(quoted_price[i]) >= $signed(bid_p_r[i])) ?
+                                      quoted_price[i] - bid_p_r[i] :
+                                      bid_p_r[i] - quoted_price[i];
+                ask_abs_diff_r[i] <= ($signed(ask_p_r[i]) >= $signed(quoted_price[i])) ?
+                                      ask_p_r[i] - quoted_price[i] :
+                                      quoted_price[i] - ask_p_r[i];
+                // Stale stage 2: compare abs-diff against pre-registered threshold.
+                bid_stale_r[i]    <= (bid_abs_diff_r[i] > stale_thresh_r[i]);
+                ask_stale_r[i]    <= (ask_abs_diff_r[i] > stale_thresh_r[i]);
                 timed_out_r[i]    <= (timeout_cnt[i] == '0);
                 // EMA update: spread_ema += (spread_r - spread_ema) >> SHIFT
                 // Uses registered spread_r (not raw spread) so the path starts
@@ -398,15 +435,17 @@ module strategy
 
                 // ---- Normal market-making
                 end else if (!pending[rr_idx]                      &&
-                             cooldown[rr_idx] == '0                &&
+                             cooldown_ok_r[rr_idx]                 &&
                              bid_v_r[rr_idx] && ask_v_r[rr_idx]   &&
                              ema_ok_r[rr_idx]) begin
 
                     if (!kill_switch && fat_finger_r[rr_idx] &&
                         tok_ok_r[rr_idx]) begin
 
-                        if (!sell_turn[rr_idx] &&
-                            pos_ok_buy_r[rr_idx]) begin
+                        // At flat (pos==0) use sell_turn to alternate sides.
+                        // When position forces a direction, override sell_turn.
+                        if (pos_ok_buy_r[rr_idx] &&
+                            (!sell_turn[rr_idx] || !pos_ok_sell_r[rr_idx])) begin
                             // BUY at skewed bid
                             order_out.order_id    <= order_id_cnt;
                             order_out.price       <= skewed_bid_r[rr_idx];
@@ -429,8 +468,8 @@ module strategy
                             qty_remaining[rr_idx] <= 32'(ORDER_QTY);
                             token_cnt[rr_idx]     <= token_cnt[rr_idx] - 1'b1;
 
-                        end else if (sell_turn[rr_idx] &&
-                                     pos_ok_sell_r[rr_idx]) begin
+                        end else if (pos_ok_sell_r[rr_idx] &&
+                                     (sell_turn[rr_idx] || !pos_ok_buy_r[rr_idx])) begin
                             // SELL at skewed ask
                             order_out.order_id    <= order_id_cnt;
                             order_out.price       <= skewed_ask_r[rr_idx];
