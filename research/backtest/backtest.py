@@ -23,6 +23,7 @@ Usage:
 import argparse
 import csv
 import math
+import random
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -42,6 +43,9 @@ class StrategyParams:
     # In backtest time units (rows): approximate cooldown as N rows at ~10 rows/s
     cooldown_rows: int   = 1       # rows between orders (1 = no cooldown)
     order_qty:     int   = 100
+    max_inventory: int   = 500     # max absolute position (units)
+    fill_prob:     float = 1.0     # queue position: prob of fill when price touches
+                                   # (1.0 = immediate fill, 0.2 = back of queue ~160ms latency)
 
 
 # ---------------------------------------------------------------------------
@@ -160,6 +164,7 @@ class BacktestResult:
     n_rows:        int   = 0
     n_fills:       int   = 0
     n_cancels:     int   = 0
+    n_queue_misses:int   = 0      # fills skipped due to queue position
     n_orders:      int   = 0
     total_pnl:     float = 0.0
     total_rebate:  float = 0.0
@@ -206,6 +211,9 @@ class BacktestResult:
         return self.total_pnl / max(1, elapsed_s) * 86400
 
     def summary(self, elapsed_s: float = 0.0) -> str:
+        queue_note = (f"  Queue fill_prob: {self.params.fill_prob:.0%}"
+                      f"  misses: {self.n_queue_misses:,}"
+                      if self.params.fill_prob < 1.0 else "")
         lines = [
             f"  Symbol:       {self.symbol.upper()}",
             f"  QUOTE_OFFSET: {self.params.quote_offset} ticks"
@@ -215,6 +223,10 @@ class BacktestResult:
             f"  Orders:       {self.n_orders:,}",
             f"  Fills:        {self.n_fills:,}  ({self.fill_rate():.1%})",
             f"  Cancels:      {self.n_cancels:,}",
+        ]
+        if queue_note:
+            lines.append(queue_note)
+        lines += [
             f"  Total P&L:    ${self.total_pnl:+.4f}",
             f"  Maker rebate: ${self.total_rebate:+.4f}",
             f"  Avg edge/fill:${self.avg_edge():+.4f}",
@@ -280,6 +292,12 @@ def run_backtest(
             # Real tick data: bar_low=ask, bar_high=bid (same as ask/bid).
             # Kline data:     bar_low=bar low, bar_high=bar high.
             if pending_side == "BUY"  and bar_low <= pending_price:
+                if random.random() > params.fill_prob:
+                    # Queue miss: volume didn't reach our position → cancel
+                    result.n_queue_misses += 1
+                    result.n_cancels += 1
+                    pending = False
+                    continue
                 position     += order_qty
                 result.record_fill("BUY",  pending_price, mid, order_qty, i - pending_row)
                 pending       = False
@@ -292,6 +310,11 @@ def run_backtest(
                 continue
 
             if pending_side == "SELL" and bar_high >= pending_price:
+                if random.random() > params.fill_prob:
+                    result.n_queue_misses += 1
+                    result.n_cancels += 1
+                    pending = False
+                    continue
                 position     -= order_qty
                 result.record_fill("SELL", pending_price, mid, order_qty, i - pending_row)
                 pending       = False
@@ -314,10 +337,12 @@ def run_backtest(
         buy_price  = bid - params.quote_offset * tick_size
         sell_price = ask + params.quote_offset * tick_size
 
-        if position <= 0:
+        if position <= 0 and position > -params.max_inventory:
             side, price = "BUY", buy_price
-        else:
+        elif position >= 0 and position < params.max_inventory:
             side, price = "SELL", sell_price
+        else:
+            continue  # at inventory limit
 
         if price <= 0:
             continue
@@ -339,7 +364,7 @@ def run_backtest(
 # ---------------------------------------------------------------------------
 
 SYMBOL_TICK_SIZES = {
-    "avaxusdt":  0.01,
+    "avaxusdt":  0.001,
     "linkusdt":  0.001,
     "aaveusdt":  0.01,
     "injusdt":   0.001,
@@ -365,6 +390,8 @@ def load_csv(path: Path, max_rows: int = 0) -> list[tuple]:
         reader = csv.DictReader(f)
         for row in reader:
             try:
+                if not row.get("bid") or not row.get("ask"):
+                    continue
                 bid = float(row["bid"])
                 ask = float(row["ask"])
                 # kline files have bar_low/bar_high; collector files use bid/ask
@@ -429,6 +456,55 @@ def print_sweep_table(results: list[BacktestResult]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Daily breakdown
+# ---------------------------------------------------------------------------
+
+def run_daily(symbol: str, tick: float, files: list[Path],
+              params: StrategyParams) -> None:
+    """Run backtest per-day and print a day-by-day P&L table."""
+    print(f"\n  {'DATE':>12}  {'TICKS':>10}  {'FILLS':>7}  {'FILL%':>6}"
+          f"  {'P&L':>10}  {'AVG_EDGE':>10}  {'MAX_POS':>8}")
+    print("  " + "-" * 75)
+
+    total_pnl = 0.0
+    days_positive = 0
+    pnl_by_day: list[float] = []
+
+    # skip kline files — only process daily collector files
+    daily_files = [f for f in files if "_klines" not in f.name]
+
+    for f in sorted(daily_files):
+        rows = load_csv(f)
+        if not rows:
+            continue
+        date = f.stem.split("_")[-1]  # e.g. "20260322"
+        r = run_backtest(symbol, tick, rows, params)
+        elapsed = (rows[-1][0] - rows[0][0]) / 1e9 if len(rows) > 1 else 1.0
+        max_pos = max(r.max_long, r.max_short)
+        total_pnl += r.total_pnl
+        pnl_by_day.append(r.total_pnl)
+        if r.total_pnl > 0:
+            days_positive += 1
+        print(f"  {date:>12}  {r.n_rows:>10,}  {r.n_fills:>7,}  {r.fill_rate():>6.1%}"
+              f"  ${r.total_pnl:>+9.2f}  ${r.avg_edge():>+9.4f}  {max_pos:>8,}")
+
+    if pnl_by_day:
+        n = len(pnl_by_day)
+        mean = total_pnl / n
+        worst = min(pnl_by_day)
+        best  = max(pnl_by_day)
+        var   = sum((x - mean) ** 2 for x in pnl_by_day) / n
+        import math
+        daily_sharpe = mean / math.sqrt(var) * math.sqrt(252) if var > 0 else float("nan")
+        print("  " + "-" * 75)
+        print(f"  {'TOTAL':>12}  {'':>10}  {'':>7}  {'':>6}"
+              f"  ${total_pnl:>+9.2f}  {'':>10}  {'':>8}")
+        print(f"\n  Days: {n}  Positive: {days_positive}/{n} ({days_positive/n:.0%})"
+              f"  Best: ${best:+.2f}  Worst: ${worst:+.2f}"
+              f"  Daily Sharpe (ann.): {daily_sharpe:.2f}")
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -440,7 +516,11 @@ def main() -> None:
     parser.add_argument("--offset",  type=int, default=2000, help="QUOTE_OFFSET ticks")
     parser.add_argument("--stale",   type=int, default=2000, help="STALE_THRESH ticks")
     parser.add_argument("--sweep",   action="store_true",    help="Parameter sweep mode")
+    parser.add_argument("--daily",   action="store_true",    help="Day-by-day P&L breakdown")
     parser.add_argument("--all",     action="store_true",    help="Run all 4 trading symbols")
+    parser.add_argument("--max-inv",   type=int,   default=500,  help="Max inventory (units)")
+    parser.add_argument("--fill-prob", type=float, default=1.0,
+                        help="Queue fill probability (1.0=optimistic, 0.2=back of queue ~160ms)")
     parser.add_argument("--verbose", action="store_true",    help="Print each fill")
     parser.add_argument("--max-rows",type=int, default=0,   help="Limit rows loaded")
     args = parser.parse_args()
@@ -461,7 +541,8 @@ def main() -> None:
             results = param_sweep(sym, all_rows, tick)
             print_sweep_table(results)
         else:
-            pr = StrategyParams(quote_offset=args.offset, stale_thresh=args.stale)
+            pr = StrategyParams(quote_offset=args.offset, stale_thresh=args.stale,
+                            fill_prob=args.fill_prob)
             r  = run_backtest(sym, tick, all_rows, pr, verbose=args.verbose)
             elapsed = (all_rows[-1][0] - all_rows[0][0]) / 1e9 if all_rows else 1
             print(r.summary(elapsed))
@@ -485,14 +566,28 @@ def main() -> None:
             all_rows.extend(load_csv(f, args.max_rows))
         all_rows.sort(key=lambda r: r[0])   # sort by timestamp
 
-        print(f"\n[{sym.upper()}]  {len(all_rows):,} ticks  tick_size=${tick}")
+        total_ticks = sum(len(load_csv(f)) for f in files)
+        print(f"\n[{sym.upper()}]  tick_size=${tick}")
 
-        if args.sweep:
+        params = StrategyParams(quote_offset=args.offset, stale_thresh=args.stale,
+                                max_inventory=args.max_inv, fill_prob=args.fill_prob)
+
+        if args.daily:
+            run_daily(sym, tick, files, params)
+        elif args.sweep:
+            all_rows = []
+            for f in files:
+                all_rows.extend(load_csv(f, args.max_rows))
+            all_rows.sort(key=lambda r: r[0])
             results = param_sweep(sym, all_rows, tick)
             print_sweep_table(results)
         else:
-            p = StrategyParams(quote_offset=args.offset, stale_thresh=args.stale)
-            r = run_backtest(sym, tick, all_rows, p, verbose=args.verbose)
+            all_rows = []
+            for f in files:
+                all_rows.extend(load_csv(f, args.max_rows))
+            all_rows.sort(key=lambda r: r[0])
+            print(f"  {len(all_rows):,} ticks")
+            r = run_backtest(sym, tick, all_rows, params, verbose=args.verbose)
             elapsed = (all_rows[-1][0] - all_rows[0][0]) / 1e9 if all_rows else 1
             print(r.summary(elapsed))
 
