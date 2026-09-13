@@ -127,7 +127,7 @@ write_checkpoint -force "$RUN_DIR/post_place.dcp"
 report_timing_summary -file "$RUN_DIR/timing_place.rpt"
 
 puts "\n--- Route ---"
-route_design
+route_design -directive AggressiveExplore
 
 puts "\n--- Post-route physical optimization ---"
 phys_opt_design -directive AggressiveExplore

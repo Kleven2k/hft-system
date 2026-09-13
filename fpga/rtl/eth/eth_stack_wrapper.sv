@@ -214,6 +214,13 @@ udp_complete udp_stack_inst (
     .m_udp_payload_axis_tlast(udp_rx_tlast),
     .m_udp_payload_axis_tuser(udp_rx_tuser),
 
+    // Non-UDP IP output — drain immediately (TCP/ICMP frames must not stall udp_complete)
+    .m_ip_payload_axis_tdata(),
+    .m_ip_payload_axis_tvalid(),
+    .m_ip_payload_axis_tready(1'b1),
+    .m_ip_payload_axis_tlast(),
+    .m_ip_payload_axis_tuser(),
+
     // Config
     .local_mac(LOCAL_MAC),
     .local_ip(LOCAL_IP),

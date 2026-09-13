@@ -80,6 +80,9 @@ package hft_pkg;
     localparam bit [7:0] ACK_REJECTED  = 8'h02;  // order rejected by exchange
     localparam bit [7:0] ACK_CANCELLED = 8'h03;  // cancel confirmed
 
+    // ---- TCP / SoupBinTCP exchange port --------------------
+    localparam bit [15:0] PORT_OUCH_TCP  = 16'd4200;   // exchange SoupBinTCP TCP port
+
     // ---- PHY reset hold time (10ms @ 125 MHz) --------------
     localparam int PHY_RESET_CYCLES = CLK_FREQ_HZ / 100;
 
