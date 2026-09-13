@@ -182,10 +182,10 @@ class BacktestResult:
     n_queue_misses:int   = 0      # fills skipped due to queue position
     n_orders:      int   = 0
     total_pnl:     float = 0.0
-    total_rebate:  float = 0.0
+    total_fees:    float = 0.0    # negative = fees paid (standard retail maker fee)
 
     # Per-fill tracking
-    fill_edges:    list  = field(default_factory=list)  # pnl per fill excl rebate
+    fill_edges:    list  = field(default_factory=list)  # per-unit price improvement, excl fees
     adverse_moves: list  = field(default_factory=list)  # mid move from fill to next cancel
     hold_times:    list  = field(default_factory=list)  # rows held before fill
 
@@ -193,17 +193,21 @@ class BacktestResult:
     max_long:      int   = 0
     max_short:     int   = 0
 
-    MAKER_REBATE_BPS: float = 1.0   # 0.01% rebate
+    # Standard retail Binance spot maker fee (no VIP tier, no BNB discount).
+    # A true maker REBATE needs VIP9+ volume tiers — not realistic for a
+    # home/retail account, so this is modeled as a cost, not income.
+    MAKER_FEE_BPS: float = 10.0   # 0.10%
 
     def record_fill(self, side: str, fill_price: float, mid_at_fill: float,
                     qty: int, hold_rows: int) -> None:
-        edge = (mid_at_fill - fill_price) if side == "BUY" else (fill_price - mid_at_fill)
+        edge_per_unit = (mid_at_fill - fill_price) if side == "BUY" else (fill_price - mid_at_fill)
+        edge     = edge_per_unit * qty
         notional = fill_price * qty
-        rebate   = notional * self.MAKER_REBATE_BPS / 10_000
-        self.fill_edges.append(edge)
+        fee      = notional * self.MAKER_FEE_BPS / 10_000
+        self.fill_edges.append(edge_per_unit)  # per-unit, for avg_edge() reporting
         self.hold_times.append(hold_rows)
-        self.total_pnl    += edge + rebate
-        self.total_rebate += rebate
+        self.total_pnl    += edge - fee
+        self.total_fees   -= fee
         self.n_fills      += 1
 
     def fill_rate(self) -> float:
@@ -243,7 +247,7 @@ class BacktestResult:
             lines.append(queue_note)
         lines += [
             f"  Total P&L:    ${self.total_pnl:+.4f}",
-            f"  Maker rebate: ${self.total_rebate:+.4f}",
+            f"  Maker fees:   ${self.total_fees:+.4f}",
             f"  Avg edge/fill:${self.avg_edge():+.4f}",
             f"  Sharpe:       {self.sharpe():.2f}",
             f"  Max long:     {self.max_long}",
