@@ -77,17 +77,24 @@ ACK_CANCELLED = 0x03
 
 
 def _send_ack(tx_sock: socket.socket, order_id: int, status: int,
-              fill_qty: int, delay_s: float) -> None:
+              fill_qty: int, delay_s: float,
+              cancelled_ids: set) -> None:
     if delay_s > 0:
         time.sleep(delay_s)
+    # Only suppress FILLED — never suppress CANCELLED ACKs (FPGA needs them to
+    # clear pending/canceling state, otherwise that slot is blocked forever).
+    if status == ACK_FILLED and order_id in cancelled_ids:
+        return   # cancel beat the fill — don't send phantom FILLED
     pkt = struct.pack(">QBI", order_id, status, fill_qty)
     tx_sock.sendto(pkt, (FPGA_IP, ACK_PORT))
 
 
 def send_ack_async(tx_sock: socket.socket, order_id: int, status: int,
-                   fill_qty: int, delay_s: float) -> None:
+                   fill_qty: int, delay_s: float,
+                   cancelled_ids: set) -> None:
     t = threading.Thread(target=_send_ack,
-                         args=(tx_sock, order_id, status, fill_qty, delay_s),
+                         args=(tx_sock, order_id, status, fill_qty, delay_s,
+                               cancelled_ids),
                          daemon=True)
     t.start()
 
@@ -117,6 +124,7 @@ def main() -> None:
 
     orders_seen  = 0
     cancels_seen = 0
+    cancelled_ids: set = set()   # orders cancelled before fill fires
 
     try:
         while True:
@@ -145,13 +153,14 @@ def main() -> None:
                         f"  (ack in {args.latency} ms)"
                     )
 
-                send_ack_async(tx, order_id, ACK_FILLED, qty, delay_s)
+                send_ack_async(tx, order_id, ACK_FILLED, qty, delay_s, cancelled_ids)
 
             elif msg_type == 0x58 and len(data) >= 9:
                 order_id = struct.unpack_from(">Q", data, 1)[0]
                 cancels_seen += 1
+                cancelled_ids.add(order_id)
                 log.info(f"CANCEL #{cancels_seen}  id={order_id:#018x}")
-                send_ack_async(tx, order_id, ACK_CANCELLED, 0, 0.0)
+                send_ack_async(tx, order_id, ACK_CANCELLED, 0, 0.0, cancelled_ids)
 
             else:
                 log.warning(f"Unknown msg_type=0x{msg_type:02X}  len={len(data)}")

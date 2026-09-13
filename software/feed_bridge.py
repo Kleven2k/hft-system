@@ -31,6 +31,13 @@ UART kill-switch commands (1 byte):
   0xB0 = kill switch ON
   0xB1 = kill switch OFF
 
+UART quote_offset frame (5 bytes, 115200 8N1):
+  [0]   0xC0 | slot[1:0]   (0xC0 = slot 0, 0xC1 = slot 1, ...)
+  [1]   offset[31:24]
+  [2]   offset[23:16]
+  [3]   offset[15:8]
+  [4]   offset[7:0]
+
 Instrument table (SYMBOLS):
   Each entry: (binance_symbol, fpga_symbol_id, tick_size_usd)
   tick_size_usd — 1 FPGA price tick in USD.  Choose so that:
@@ -39,8 +46,8 @@ Instrument table (SYMBOLS):
 
 Usage:
   pip install websockets pyserial
-  python feed_bridge.py [--paper]   # --paper keeps kill_switch ON (default)
-  python feed_bridge.py --live       # removes kill_switch (USE WITH CAUTION)
+  python feed_bridge.py [--paper]   # --paper: kill_switch OFF, OUCH goes to ack_simulator
+  python feed_bridge.py --live       # --live:  kill_switch OFF, OUCH goes to real exchange (USE WITH CAUTION)
 """
 
 import argparse
@@ -86,11 +93,23 @@ UART_BAUD = 115200
 #   BTC min increment $0.01 → tick=0.01, $20 drift → drift_limit=2000
 #     (was tick=0.1 → both bid and ask rounded to same tick, spread=0)
 SYMBOLS = [
-    ("ethusdt",  0, 0.01,  200),
-    ("solusdt",  1, 0.001, 200),
-    ("bnbusdt",  2, 0.01,  200),
-    ("btcusdt",  3, 0.01, 2000),
+    # Mid-tier tokens: wider spreads (5-30 ticks), less HFT competition than BTC/ETH.
+    # tick_size chosen so 1 tick = Binance min price increment for that pair.
+    ("avaxusdt", 0, 0.01,  200),   # AVAX  ~$35,  spread ~5-20 ticks,  256 ticks=$2.56
+    ("linkusdt", 1, 0.001, 200),   # LINK  ~$15,  spread ~5-15 ticks,  256 ticks=$0.256
+    ("aaveusdt", 2, 0.01,  200),   # AAVE  ~$200, spread ~5-20 ticks,  256 ticks=$2.56
+    ("injusdt",  3, 0.001, 200),   # INJ   ~$25,  spread ~5-20 ticks,  256 ticks=$0.256
 ]
+
+# Per-slot quote offset in price ticks (UART-sent to FPGA at startup).
+# Based on backtest parameter sweep over 7 days of 1s klines.
+# Change and restart feed_bridge.py to retune — no FPGA rebuild needed.
+QUOTE_OFFSETS = {
+    0: 3,    # AVAX:  3 ticks = $0.03  (Sharpe 5.12 at offset=3, stale=2)
+    1: 10,   # LINK: 10 ticks = $0.01  (consistent $31/3d at 2.5% fill rate)
+    2: 5,    # AAVE:  5 ticks = $0.05  (high maker rebate per fill ~$1)
+    3: 3,    # INJ:   3 ticks = $0.003 (Sharpe 2.20 at offset=3, stale=2)
+}
 
 # Order book has MAX_LEVELS=256.  price_idx = price[7:0] - price_base[7:0].
 BASE_OFFSET = 50   # ticks — price_base sits this many ticks below current bid
@@ -168,6 +187,13 @@ def uart_kill_switch(on: bool) -> None:
     """Send kill-switch ON (0xB0) or OFF (0xB1) command."""
     _uart_write(bytes([0xB0 if on else 0xB1]))
     log.info(f"UART  kill_switch = {'ON' if on else 'OFF'}")
+
+
+def uart_set_quote_offset(slot: int, offset_ticks: int) -> None:
+    """Send a 5-byte quote_offset frame (0xC0|slot + 4-byte big-endian value)."""
+    frame = bytes([0xC0 | (slot & 0x3)]) + struct.pack(">I", offset_ticks & 0xFFFF_FFFF)
+    _uart_write(frame)
+    log.info(f"UART  quote_offset[{slot}] = {offset_ticks} ticks")
 
 # ---------------------------------------------------------------------------
 # UDP helpers
@@ -283,10 +309,12 @@ def _stop_loss_monitor() -> None:
         return
 
     threshold_ticks = int(SL_THRESHOLD_USD * 10_000)
+    # Listen on localhost relay port forwarded by monitor.py (avoids port conflict on 42002)
+    SL_RELAY_PORT = 42003
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.bind(("0.0.0.0", TELEM_PORT))
+    sock.bind(("127.0.0.1", SL_RELAY_PORT))
     sock.settimeout(2.0)
-    log.info(f"SL    monitor active — threshold −${SL_THRESHOLD_USD:.2f} per slot")
+    log.info(f"SL    monitor active — threshold −${SL_THRESHOLD_USD:.2f} per slot  (relay port {SL_RELAY_PORT})")
 
     import struct as _struct
     while True:
@@ -332,9 +360,17 @@ async def run(paper_mode: bool) -> None:
 
     log.info(f"Connecting to {WS_URL}")
     log.info(f"FPGA target: {FPGA_IP}:{FPGA_PORT}")
-    log.info(f"Kill switch: {'ON (paper mode)' if paper_mode else 'OFF (live mode)'}")
-    uart_kill_switch(on=paper_mode)
+    # Start with kill_switch ON — released only after all price_bases are configured.
+    # Default hft_top.sv price_base values are wrong for current symbols; if orders
+    # fire before UART corrects price_base, the order book returns garbled prices and
+    # we get catastrophic fills (e.g. BUY AAVE at $5000 when market is $112).
+    log.info(f"Kill switch: ON (held during init — released after all symbols configured)")
+    uart_kill_switch(on=True)
+    for slot, ticks in QUOTE_OFFSETS.items():
+        uart_set_quote_offset(slot, ticks)
     start_stop_loss_monitor()
+
+    _kill_released = False
 
     async for ws in websockets.connect(WS_URL, ping_interval=20):
         try:
@@ -356,6 +392,12 @@ async def run(paper_mode: bool) -> None:
 
                 states[sym].on_update(bid_usd, ask_usd)
 
+                # Release kill_switch once every symbol has sent its price_base.
+                if not _kill_released and all(s.initialized for s in states.values()):
+                    _kill_released = True
+                    log.info("All symbols initialized — releasing kill switch")
+                    uart_kill_switch(on=False)
+
         except websockets.ConnectionClosed:
             log.warning("WebSocket disconnected — reconnecting in 2 s")
             await asyncio.sleep(2)
@@ -372,9 +414,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Binance → FPGA market data bridge")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--paper", action="store_true", default=True,
-                      help="Paper mode: kill_switch ON (default, safe)")
+                      help="Paper mode: OUCH to ack_simulator (default)")
     mode.add_argument("--live",  action="store_true", default=False,
-                      help="Live mode: kill_switch OFF (real orders — be careful)")
+                      help="Live mode: OUCH to real exchange (be careful)")
     args = parser.parse_args()
 
     paper = not args.live

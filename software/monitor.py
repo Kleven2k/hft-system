@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-monitor.py — Real-time FPGA telemetry display (Phase 20/21B)
+monitor.py — Real-time FPGA telemetry display (Phase 20/21B/25)
 
-Listens on UDP port 42002 for 64-byte telemetry packets from the FPGA
+Listens on UDP port 42002 for 80-byte telemetry packets from the FPGA
 and displays a live dashboard updated once per second.
 
 Usage:
-    python fpga/tb/system/monitor.py
+    python software/monitor.py
 
-Packet format (big-endian, 64 bytes):
+Packet format (big-endian, 80 bytes):
     [ 0- 3]  magic   0x48465401  ('HFT\\x01')
     [ 4- 7]  seq_num (uint32)
     [ 8-15]  order_id_cnt (uint64)  — total orders ever emitted
@@ -18,19 +18,26 @@ Packet format (big-endian, 64 bytes):
     [52-63]  slot 3
       flags: bit0 = bid_valid, bit1 = ask_valid
       pnl:   signed int32, edge-vs-mid in price ticks (1 tick = $0.0001)
+    [64-67]  lat_min   (uint32, clock cycles, 8 ns each)
+    [68-71]  lat_max   (uint32, clock cycles)
+    [72-75]  lat_last  (uint32, clock cycles)
+    [76-79]  lat_count (uint32, number of measurements)
 """
 
 import socket, struct, os, time, datetime
 
 MY_IP      = "0.0.0.0"
 TELEM_PORT = 42002
+RELAY_PORT = 42003   # localhost relay for feed_bridge stop-loss monitor
 MAGIC      = b'\x48\x46\x54\x01'
-PKT_BYTES  = 64
+PKT_BYTES  = 80
 MAX_BURST  = 5  # must match strategy MAX_BURST parameter
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 sock.bind((MY_IP, TELEM_PORT))
 sock.settimeout(5)
+
+relay = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
 def clear():
     os.system('cls' if os.name == 'nt' else 'clear')
@@ -66,6 +73,8 @@ try:
         if len(data) < PKT_BYTES or data[:4] != MAGIC:
             continue
 
+        relay.sendto(data, ("127.0.0.1", RELAY_PORT))
+
         seq,      = struct.unpack('>I', data[4:8])
         oid_cnt,  = struct.unpack('>Q', data[8:16])
 
@@ -78,6 +87,15 @@ try:
             token   = data[off+9]
             flags   = data[off+10]
             slots.append((pos, pnl, reject, token, flags))
+
+        # Phase 25 — latency stats
+        if len(data) >= 80:
+            lat_min_cyc,   = struct.unpack('>I', data[64:68])
+            lat_max_cyc,   = struct.unpack('>I', data[68:72])
+            lat_last_cyc,  = struct.unpack('>I', data[72:76])
+            lat_count_val, = struct.unpack('>I', data[76:80])
+        else:
+            lat_min_cyc = lat_max_cyc = lat_last_cyc = lat_count_val = 0
 
         now = datetime.datetime.now()
         pkt_count += 1
@@ -108,6 +126,14 @@ try:
             bar = token_bar(tok)
             ps  = pnl_str(pnl)
             print(f"║   {i}   {pos:+8d}   {ps:>10s}     {rej:3d}    {bar}  {bv}  {av}{sl} ║")
+        print(f"╠══════════════════════════════════════════════════════════════╣")
+        def cyc_to_ns(c): return c * 8
+        if lat_count_val > 0:
+            print(f"║  Latency (quote→order):  min={cyc_to_ns(lat_min_cyc):,} ns  "
+                  f"max={cyc_to_ns(lat_max_cyc):,} ns  "
+                  f"last={cyc_to_ns(lat_last_cyc):,} ns  n={lat_count_val:,}   ║")
+        else:
+            print(f"║  Latency: no measurements yet                                ║")
         print(f"╚══════════════════════════════════════════════════════════════╝")
         print(f"  Packets received: {pkt_count}   Ctrl-C to exit")
 
