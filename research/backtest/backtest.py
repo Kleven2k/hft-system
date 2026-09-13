@@ -48,6 +48,21 @@ class StrategyParams:
                                    # (1.0 = immediate fill, 0.2 = back of queue ~160ms latency)
 
 
+def qty_for_notional(notional_usd: float, price: float, max_inventory_mult: int = 5) -> tuple[int, int]:
+    """
+    Derive (order_qty, max_inventory) in units from a target notional per
+    order, given the instrument's current price.
+
+    order_qty as a flat unit count (the historical default) makes P&L
+    incomparable across symbols at very different price levels — e.g. 100
+    units of AAVE (~$125) is ~15-100x the notional of 100 units of AVAX/LINK/
+    INJ (~$1-10). Pin to notional instead so symbols are compared on equal
+    capital-per-trade footing.
+    """
+    order_qty = max(1, round(notional_usd / price))
+    return order_qty, order_qty * max_inventory_mult
+
+
 # ---------------------------------------------------------------------------
 # Fill model
 # ---------------------------------------------------------------------------
@@ -372,8 +387,36 @@ SYMBOL_TICK_SIZES = {
     "solusdt":   0.001,
     "bnbusdt":   0.01,
     "btcusdt":   0.01,
-    # Add more as needed
+    # Fallback only — exchanges change price precision over time (e.g. AVAX
+    # was $0.01 in March 2026, $0.001 by August), so prefer detect_tick_size()
+    # on the actual file being backtested rather than trusting this table.
 }
+
+
+def detect_tick_size(path: Path, sample_rows: int = 5000) -> Optional[float]:
+    """
+    Infer the exchange's price tick size directly from a CSV's bid/ask values,
+    rather than trusting a hardcoded per-symbol table (which goes stale when
+    an exchange changes price precision — see SYMBOL_TICK_SIZES note above).
+
+    Takes the max decimal-place count seen across a sample of raw price
+    strings (a single value like "9.2" is ambiguous — "9.19" close by
+    reveals the true precision).
+    """
+    max_decimals = 0
+    with open(path, newline="") as f:
+        reader = csv.DictReader(f)
+        for i, row in enumerate(reader):
+            if i >= sample_rows:
+                break
+            for key in ("bid", "ask"):
+                val = row.get(key, "")
+                if "." in val:
+                    decimals = len(val.rstrip("0").split(".", 1)[1])
+                    max_decimals = max(max_decimals, decimals)
+    if max_decimals == 0:
+        return None
+    return 10 ** -max_decimals
 
 
 def load_csv(path: Path, max_rows: int = 0) -> list[tuple]:
@@ -417,7 +460,9 @@ def find_data_files(symbol: str, date: str = "") -> list[Path]:
 
 def param_sweep(symbol: str, rows: list[tuple], tick_size: float,
                 offsets: list[int] = None,
-                stale_threshes: list[int] = None) -> list[BacktestResult]:
+                stale_threshes: list[int] = None,
+                order_qty: int = 100,
+                max_inventory: int = 500) -> list[BacktestResult]:
     """Grid search over QUOTE_OFFSET and STALE_THRESH."""
     if offsets is None:
         # Realistic range for market making: 1–20 ticks from mid.
@@ -429,7 +474,8 @@ def param_sweep(symbol: str, rows: list[tuple], tick_size: float,
     results = []
     for qo in offsets:
         for st in stale_threshes:
-            p = StrategyParams(quote_offset=qo, stale_thresh=st)
+            p = StrategyParams(quote_offset=qo, stale_thresh=st,
+                                order_qty=order_qty, max_inventory=max_inventory)
             r = run_backtest(symbol, tick_size, rows, p)
             results.append(r)
 
@@ -459,16 +505,27 @@ def print_sweep_table(results: list[BacktestResult]) -> None:
 # Daily breakdown
 # ---------------------------------------------------------------------------
 
-def run_daily(symbol: str, tick: float, files: list[Path],
-              params: StrategyParams) -> None:
-    """Run backtest per-day and print a day-by-day P&L table."""
-    print(f"\n  {'DATE':>12}  {'TICKS':>10}  {'FILLS':>7}  {'FILL%':>6}"
+def run_daily(symbol: str, fallback_tick: float, files: list[Path],
+              offset: int, stale: int, fill_prob: float,
+              notional: float = 0.0, max_inv: int = 500) -> None:
+    """Run backtest per-day and print a day-by-day P&L table.
+
+    Tick size is auto-detected per file rather than fixed for the whole
+    run — exchanges change price precision over time (e.g. AVAX was $0.01
+    in March 2026, $0.001 by August), and a stale tick size silently
+    produces zero fills for the whole affected period.
+
+    order_qty is likewise re-derived per file from that day's price when
+    notional > 0, since price level can drift materially over months.
+    """
+    print(f"\n  {'DATE':>12}  {'TICKS':>10}  {'TICK':>8}  {'QTY':>6}  {'FILLS':>7}  {'FILL%':>6}"
           f"  {'P&L':>10}  {'AVG_EDGE':>10}  {'MAX_POS':>8}")
-    print("  " + "-" * 75)
+    print("  " + "-" * 92)
 
     total_pnl = 0.0
     days_positive = 0
     pnl_by_day: list[float] = []
+    last_tick: Optional[float] = None
 
     # skip kline files — only process daily collector files
     daily_files = [f for f in files if "_klines" not in f.name]
@@ -478,6 +535,17 @@ def run_daily(symbol: str, tick: float, files: list[Path],
         if not rows:
             continue
         date = f.stem.split("_")[-1]  # e.g. "20260322"
+        tick = detect_tick_size(f) or fallback_tick
+        if last_tick is not None and tick != last_tick:
+            print(f"  *** tick size changed: ${last_tick} -> ${tick} on {date} ***")
+        last_tick = tick
+
+        order_qty, max_inventory = (qty_for_notional(notional, rows[0][1]) if notional
+                                     else (100, max_inv))
+        params = StrategyParams(quote_offset=offset, stale_thresh=stale,
+                                order_qty=order_qty, max_inventory=max_inventory,
+                                fill_prob=fill_prob)
+
         r = run_backtest(symbol, tick, rows, params)
         elapsed = (rows[-1][0] - rows[0][0]) / 1e9 if len(rows) > 1 else 1.0
         max_pos = max(r.max_long, r.max_short)
@@ -485,7 +553,7 @@ def run_daily(symbol: str, tick: float, files: list[Path],
         pnl_by_day.append(r.total_pnl)
         if r.total_pnl > 0:
             days_positive += 1
-        print(f"  {date:>12}  {r.n_rows:>10,}  {r.n_fills:>7,}  {r.fill_rate():>6.1%}"
+        print(f"  {date:>12}  {r.n_rows:>10,}  ${tick:>7g}  {order_qty:>6,}  {r.n_fills:>7,}  {r.fill_rate():>6.1%}"
               f"  ${r.total_pnl:>+9.2f}  ${r.avg_edge():>+9.4f}  {max_pos:>8,}")
 
     if pnl_by_day:
@@ -496,8 +564,8 @@ def run_daily(symbol: str, tick: float, files: list[Path],
         var   = sum((x - mean) ** 2 for x in pnl_by_day) / n
         import math
         daily_sharpe = mean / math.sqrt(var) * math.sqrt(252) if var > 0 else float("nan")
-        print("  " + "-" * 75)
-        print(f"  {'TOTAL':>12}  {'':>10}  {'':>7}  {'':>6}"
+        print("  " + "-" * 92)
+        print(f"  {'TOTAL':>12}  {'':>10}  {'':>8}  {'':>6}  {'':>7}  {'':>6}"
               f"  ${total_pnl:>+9.2f}  {'':>10}  {'':>8}")
         print(f"\n  Days: {n}  Positive: {days_positive}/{n} ({days_positive/n:.0%})"
               f"  Best: ${best:+.2f}  Worst: ${worst:+.2f}"
@@ -518,7 +586,11 @@ def main() -> None:
     parser.add_argument("--sweep",   action="store_true",    help="Parameter sweep mode")
     parser.add_argument("--daily",   action="store_true",    help="Day-by-day P&L breakdown")
     parser.add_argument("--all",     action="store_true",    help="Run all 4 trading symbols")
-    parser.add_argument("--max-inv",   type=int,   default=500,  help="Max inventory (units)")
+    parser.add_argument("--max-inv",   type=int,   default=500,  help="Max inventory (units, ignored if --notional set)")
+    parser.add_argument("--notional", type=float, default=0.0,
+                        help="Target notional per order in USD (order_qty derived from price; "
+                             "makes P&L comparable across symbols at different price levels). "
+                             "0 = use --order-qty/fixed unit count instead")
     parser.add_argument("--fill-prob", type=float, default=1.0,
                         help="Queue fill probability (1.0=optimistic, 0.2=back of queue ~160ms)")
     parser.add_argument("--verbose", action="store_true",    help="Print each fill")
@@ -531,17 +603,21 @@ def main() -> None:
         # Direct file path mode — infer symbol from filename
         p = Path(args.file)
         sym = p.stem.split("_")[0].lower()
-        tick = SYMBOL_TICK_SIZES.get(sym, 0.01)
+        tick = detect_tick_size(p) or SYMBOL_TICK_SIZES.get(sym, 0.01)
         all_rows = load_csv(p, args.max_rows)
         if not all_rows:
             print(f"No rows loaded from {p}")
             return
-        print(f"\n[{sym.upper()}]  {len(all_rows):,} ticks  tick_size=${tick}  ({p.name})")
+        order_qty, max_inv = ((qty_for_notional(args.notional, all_rows[0][1]))
+                              if args.notional else (100, args.max_inv))
+        print(f"\n[{sym.upper()}]  {len(all_rows):,} ticks  tick_size=${tick}  ({p.name})"
+              + (f"  order_qty={order_qty} (${args.notional:.0f} notional)" if args.notional else ""))
         if args.sweep:
-            results = param_sweep(sym, all_rows, tick)
+            results = param_sweep(sym, all_rows, tick, order_qty=order_qty, max_inventory=max_inv)
             print_sweep_table(results)
         else:
             pr = StrategyParams(quote_offset=args.offset, stale_thresh=args.stale,
+                            order_qty=order_qty, max_inventory=max_inv,
                             fill_prob=args.fill_prob)
             r  = run_backtest(sym, tick, all_rows, pr, verbose=args.verbose)
             elapsed = (all_rows[-1][0] - all_rows[0][0]) / 1e9 if all_rows else 1
@@ -551,7 +627,7 @@ def main() -> None:
     symbols = TRADING_SYMBOLS if args.all else [args.symbol]
 
     for sym in symbols:
-        tick = SYMBOL_TICK_SIZES.get(sym, 0.01)
+        fallback_tick = SYMBOL_TICK_SIZES.get(sym, 0.01)
 
         # Find data files
         files = find_data_files(sym, args.date)
@@ -560,32 +636,39 @@ def main() -> None:
             print(f"  Run: python data_collector.py --symbols {sym}")
             continue
 
-        # Load all matching files
-        all_rows = []
-        for f in files:
-            all_rows.extend(load_csv(f, args.max_rows))
-        all_rows.sort(key=lambda r: r[0])   # sort by timestamp
-
-        total_ticks = sum(len(load_csv(f)) for f in files)
+        # Tick size from the most recent file — exchanges change price
+        # precision over time (see detect_tick_size docstring), so this
+        # matters most for --daily (detected fresh per file there) and for
+        # matching what a live strategy would use *today*.
+        tick = detect_tick_size(sorted(files)[-1]) or fallback_tick
         print(f"\n[{sym.upper()}]  tick_size=${tick}")
 
-        params = StrategyParams(quote_offset=args.offset, stale_thresh=args.stale,
-                                max_inventory=args.max_inv, fill_prob=args.fill_prob)
-
         if args.daily:
-            run_daily(sym, tick, files, params)
-        elif args.sweep:
-            all_rows = []
-            for f in files:
-                all_rows.extend(load_csv(f, args.max_rows))
-            all_rows.sort(key=lambda r: r[0])
-            results = param_sweep(sym, all_rows, tick)
-            print_sweep_table(results)
+            # run_daily loads and processes one file at a time — no need to
+            # pre-load everything into memory first. order_qty is re-derived
+            # per file from that day's price when --notional is set.
+            run_daily(sym, tick, files, args.offset, args.stale, args.fill_prob,
+                      notional=args.notional, max_inv=args.max_inv)
         else:
             all_rows = []
             for f in files:
                 all_rows.extend(load_csv(f, args.max_rows))
-            all_rows.sort(key=lambda r: r[0])
+            all_rows.sort(key=lambda r: r[0])   # sort by timestamp
+
+            order_qty, max_inv = ((qty_for_notional(args.notional, all_rows[0][1]))
+                                  if args.notional and all_rows else (100, args.max_inv))
+            if args.notional:
+                print(f"  order_qty={order_qty} (${args.notional:.0f} notional)")
+
+            if args.sweep:
+                results = param_sweep(sym, all_rows, tick, order_qty=order_qty, max_inventory=max_inv)
+                print_sweep_table(results)
+                continue
+
+            params = StrategyParams(quote_offset=args.offset, stale_thresh=args.stale,
+                                    order_qty=order_qty, max_inventory=max_inv,
+                                    fill_prob=args.fill_prob)
+
             print(f"  {len(all_rows):,} ticks")
             r = run_backtest(sym, tick, all_rows, params, verbose=args.verbose)
             elapsed = (all_rows[-1][0] - all_rows[0][0]) / 1e9 if all_rows else 1
