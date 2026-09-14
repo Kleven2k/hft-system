@@ -42,6 +42,7 @@ import csv
 import math
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Optional
 
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -89,6 +90,9 @@ class MMParams:
     # Order size (shares)
     order_qty:          int   = 100
 
+    # Max absolute position (shares) — stop adding to a losing side once hit
+    max_inventory:      int   = 500
+
     # Maker rebate — US exchanges pay ~0.2 cents/share for adding liquidity
     maker_rebate_per_share: float = 0.002   # $0.002/share
 
@@ -97,6 +101,37 @@ class MMParams:
 
     def quote_offset_usd(self) -> float:
         return self.quote_offset_ticks * self.tick_size
+
+
+def median_mid_price(ticks, sample_size: int = 2000) -> Optional[float]:
+    """
+    Robust price estimate for sizing orders — the first tick(s) in a
+    reconstructed book can be stale/partial-book garbage (e.g. a resting
+    order at $1.01 on a $170 stock, left over before the book has enough
+    adds to reflect the real market), so take the median of a sample
+    rather than trusting a single early value.
+    """
+    mids = []
+    for t in ticks:
+        if t.best_bid and t.best_ask:
+            mids.append((t.best_bid + t.best_ask) / 2.0)
+        if len(mids) >= sample_size:
+            break
+    if not mids:
+        return None
+    mids.sort()
+    return mids[len(mids) // 2]
+
+
+def qty_for_notional(notional_usd: float, price: float, max_inventory_mult: int = 5) -> tuple[int, int]:
+    """
+    Derive (order_qty, max_inventory) in shares from a target notional per
+    order, given the stock's current price — so AAPL/MSFT/AMD etc. are
+    compared on equal capital-per-trade footing instead of a flat share
+    count (100 shares of a $400 stock is 2x the notional of a $200 stock).
+    """
+    order_qty = max(1, round(notional_usd / price))
+    return order_qty, order_qty * max_inventory_mult
 
 
 # ---------------------------------------------------------------------------
@@ -115,6 +150,13 @@ class MMResult:
 
     total_pnl:    float = 0.0
     total_rebate: float = 0.0
+    mark_to_mid_pnl: float = 0.0   # unrealized P&L on any position left open at end of run
+
+    # Position (shares; + = long, - = short) and running cost basis (USD)
+    position:     int   = 0
+    cost_basis:   float = 0.0
+    max_long:     int   = 0
+    max_short:    int   = 0
 
     # Per-fill tracking
     fill_edges:       list = field(default_factory=list)   # mid_at_fill - fill_price (BUY)
@@ -130,6 +172,10 @@ class MMResult:
 
     def fill_rate(self) -> float:
         return self.n_fills / max(1, self.n_orders)
+
+    def total_pnl_marked(self) -> float:
+        """Realized P&L plus mark-to-mid on any residual open position."""
+        return self.total_pnl + self.mark_to_mid_pnl
 
     def avg_edge(self) -> float:
         return sum(self.fill_edges) / max(1, len(self.fill_edges))
@@ -155,7 +201,7 @@ class MMResult:
         return self.elapsed_ns / 1e9
 
     def pnl_per_hour(self) -> float:
-        return self.total_pnl / max(1, self.elapsed_s()) * 3600
+        return self.total_pnl_marked() / max(1, self.elapsed_s()) * 3600
 
     def summary(self) -> str:
         lines = [
@@ -173,12 +219,16 @@ class MMResult:
             f"  Fills:             {self.n_fills:,}  ({self.fill_rate():.1%})",
             f"  Cancels (stale):   {self.n_cancels:,}",
             f"  ---",
-            f"  Total P&L:         ${self.total_pnl:+.4f}",
+            f"  Realized P&L:      ${self.total_pnl:+.4f}",
+            f"  Mark-to-mid (open):${self.mark_to_mid_pnl:+.4f}",
+            f"  Total P&L:         ${self.total_pnl_marked():+.4f}",
             f"  Maker rebate:      ${self.total_rebate:+.4f}",
             f"  Avg edge/fill:     ${self.avg_edge():+.5f}",
             f"  P&L/hour:          ${self.pnl_per_hour():+.4f}",
             f"  Sharpe:            {self.sharpe():.2f}",
             f"  Adverse sel. rate: {self.adverse_selection_rate():.1%}",
+            f"  Max long:          {self.max_long}  Max short: {self.max_short}",
+            f"  End position:      {self.position:+d}",
         ]
         if self.msg_counts:
             lines.append("  ---")
@@ -290,6 +340,12 @@ def run_backtest(
                 result.n_fills      += 1
                 result.hold_times_ns.append(tick.timestamp_ns - pending_ts)
 
+                signed_qty = params.order_qty if pending_side == "BUY" else -params.order_qty
+                result.position   += signed_qty
+                result.cost_basis += signed_qty * pending_price
+                result.max_long   = max(result.max_long,  result.position)
+                result.max_short  = max(result.max_short, -result.position)
+
                 # Record adverse selection: mid movement LOOKAHEAD ticks later
                 # (filled at index i, check recent_mids[-1] vs pending_mid)
                 future_mid = recent_mids[-1] if recent_mids else mid
@@ -305,7 +361,7 @@ def run_backtest(
                 if verbose:
                     print(f"  FILL {pending_side:4s}  price=${pending_price:.4f}"
                           f"  mid=${mid:.4f}  edge=${edge*params.order_qty:+.4f}"
-                          f"  ts={tick.timestamp_ns}")
+                          f"  pos={result.position:+d}  ts={tick.timestamp_ns}")
             continue
 
         # ── Place new order ───────────────────────────────────────────
@@ -319,14 +375,16 @@ def run_backtest(
         buy_price  = tick.best_bid  - offset
         sell_price = tick.best_ask  + offset
 
-        # Alternate sides to stay flat (same as FPGA strategy)
-        # Simple: always try to buy first (can be made more sophisticated)
-        if result.n_fills % 2 == 0:
+        # Quote on whichever side reduces inventory (mirrors strategy.sv):
+        # flat or short -> BUY, flat or long -> SELL. Skip the side entirely
+        # once max_inventory is hit, rather than accumulating unboundedly.
+        side, price = None, 0.0
+        if result.position <= 0 and result.position > -params.max_inventory:
             side, price = "BUY", buy_price
-        else:
+        elif result.position >= 0 and result.position < params.max_inventory:
             side, price = "SELL", sell_price
 
-        if price <= 0:
+        if side is None or price <= 0:
             continue
 
         pending       = True
@@ -335,6 +393,11 @@ def run_backtest(
         pending_mid   = mid
         pending_ts    = tick.timestamp_ns
         result.n_orders += 1
+
+    # Mark any residual position to the last known mid — an open position
+    # that's never closed isn't free money, it's unrealized risk.
+    if result.position != 0 and recent_mids:
+        result.mark_to_mid_pnl = result.position * recent_mids[-1] - result.cost_basis
 
     return result
 
@@ -417,11 +480,19 @@ def run_backtest_ticks(
                 future_mid = recent_mids[-1] if recent_mids else mid
                 adv = future_mid - pending_price if pending_side == "BUY" else pending_price - future_mid
                 result.adverse_moves.append(adv)
+
+                signed_qty = params.order_qty if pending_side == "BUY" else -params.order_qty
+                result.position   += signed_qty
+                result.cost_basis += signed_qty * pending_price
+                result.max_long   = max(result.max_long,  result.position)
+                result.max_short  = max(result.max_short, -result.position)
+
                 pending = False
                 cooldown_until_tick = result.n_ticks + 5
                 if verbose:
                     print(f"  FILL {pending_side:4s}  price=${pending_price:.4f}"
-                          f"  mid=${mid:.4f}  edge=${edge*params.order_qty:+.4f}")
+                          f"  mid=${mid:.4f}  edge=${edge*params.order_qty:+.4f}"
+                          f"  pos={result.position:+d}")
             continue
 
         if result.n_ticks < cooldown_until_tick:
@@ -431,12 +502,16 @@ def run_backtest_ticks(
         buy_price  = tick.best_bid  - offset
         sell_price = tick.best_ask  + offset
 
-        if result.n_fills % 2 == 0:
+        # Quote on whichever side reduces inventory (mirrors strategy.sv):
+        # flat or short -> BUY, flat or long -> SELL. Skip the side entirely
+        # once max_inventory is hit, rather than accumulating unboundedly.
+        side, price = None, 0.0
+        if result.position <= 0 and result.position > -params.max_inventory:
             side, price = "BUY", buy_price
-        else:
+        elif result.position >= 0 and result.position < params.max_inventory:
             side, price = "SELL", sell_price
 
-        if price <= 0:
+        if side is None or price <= 0:
             continue
 
         pending       = True
@@ -446,10 +521,16 @@ def run_backtest_ticks(
         pending_ts    = tick.timestamp_ns
         result.n_orders += 1
 
+    # Mark any residual position to the last known mid — an open position
+    # that's never closed isn't free money, it's unrealized risk.
+    if result.position != 0 and recent_mids:
+        result.mark_to_mid_pnl = result.position * recent_mids[-1] - result.cost_basis
+
     return result
 
 
-def sweep_ticks(symbol: str, ticks_factory, tick_size: float) -> None:
+def sweep_ticks(symbol: str, ticks_factory, tick_size: float,
+                order_qty: int = 100, max_inventory: int = 500) -> None:
     """Sweep using pre-parsed BookTick objects (fast path)."""
     offsets        = [0, 1, 2, 3, 5]
     stale_threshes = [2, 3, 5, 10]
@@ -461,18 +542,19 @@ def sweep_ticks(symbol: str, ticks_factory, tick_size: float) -> None:
     results = []
     for qo in offsets:
         for st in stale_threshes:
-            p = MMParams(quote_offset_ticks=qo, stale_ticks=st, tick_size=tick_size)
+            p = MMParams(quote_offset_ticks=qo, stale_ticks=st, tick_size=tick_size,
+                         order_qty=order_qty, max_inventory=max_inventory)
             r = run_backtest_ticks(symbol, ticks_factory(), p)
             results.append(r)
 
-    for r in sorted(results, key=lambda x: x.total_pnl, reverse=True):
+    for r in sorted(results, key=lambda x: x.total_pnl_marked(), reverse=True):
         p = r.params
         print(
             f"{p.quote_offset_ticks:>8d}"
             f"{p.stale_ticks:>7d}"
             f"{r.n_fills:>7d}"
             f"{r.fill_rate():>7.1%}"
-            f"  ${r.total_pnl:>+8.4f}"
+            f"  ${r.total_pnl_marked():>+8.4f}"
             f"  ${r.pnl_per_hour():>+7.2f}"
             f"  ${r.avg_edge():>+8.5f}"
             f"  {r.adverse_selection_rate():>8.1%}"
@@ -480,7 +562,8 @@ def sweep_ticks(symbol: str, ticks_factory, tick_size: float) -> None:
         )
 
 
-def sweep(symbol: str, messages_factory, tick_size: float) -> None:
+def sweep(symbol: str, messages_factory, tick_size: float,
+          order_qty: int = 100, max_inventory: int = 500) -> None:
     offsets      = [0, 1, 2, 3, 5]
     stale_threshes = [2, 3, 5, 10]
 
@@ -491,18 +574,19 @@ def sweep(symbol: str, messages_factory, tick_size: float) -> None:
     results = []
     for qo in offsets:
         for st in stale_threshes:
-            p = MMParams(quote_offset_ticks=qo, stale_ticks=st, tick_size=tick_size)
+            p = MMParams(quote_offset_ticks=qo, stale_ticks=st, tick_size=tick_size,
+                         order_qty=order_qty, max_inventory=max_inventory)
             r = run_backtest(symbol, messages_factory(), p)
             results.append(r)
 
-    for r in sorted(results, key=lambda x: x.total_pnl, reverse=True):
+    for r in sorted(results, key=lambda x: x.total_pnl_marked(), reverse=True):
         p = r.params
         print(
             f"{p.quote_offset_ticks:>8d}"
             f"{p.stale_ticks:>7d}"
             f"{r.n_fills:>7d}"
             f"{r.fill_rate():>7.1%}"
-            f"  ${r.total_pnl:>+8.4f}"
+            f"  ${r.total_pnl_marked():>+8.4f}"
             f"  ${r.pnl_per_hour():>+7.2f}"
             f"  ${r.avg_edge():>+8.5f}"
             f"  {r.adverse_selection_rate():>8.1%}"
@@ -526,6 +610,10 @@ def main() -> None:
                         help="Tick size in dollars (default 0.01)")
     parser.add_argument("--qty",         type=int, default=100,
                         help="Order size in shares (default 100)")
+    parser.add_argument("--notional",    type=float, default=0.0,
+                        help="Target notional per order in USD (order_qty derived from "
+                             "price; makes P&L comparable across symbols at different "
+                             "price levels). 0 = use --qty as a flat share count instead")
     parser.add_argument("--synthetic",   action="store_true",
                         help="Use synthetic data (no ITCH file needed)")
     parser.add_argument("--synth-price", type=float, default=185.0,
@@ -555,15 +643,21 @@ def main() -> None:
                 tick_size   = tick_size,
             )
 
+        order_qty, max_inv = (qty_for_notional(args.notional, args.synth_price)
+                              if args.notional else (args.qty, 500))
+        if args.notional:
+            print(f"  order_qty={order_qty} (${args.notional:.0f} notional)")
+
         if args.sweep:
-            sweep(args.symbol, make_messages, tick_size)
+            sweep(args.symbol, make_messages, tick_size, order_qty=order_qty, max_inventory=max_inv)
             return
 
         params = MMParams(
             quote_offset_ticks = args.offset,
             stale_ticks        = args.stale,
             tick_size          = tick_size,
-            order_qty          = args.qty,
+            order_qty          = order_qty,
+            max_inventory       = max_inv,
         )
         result = run_backtest(args.symbol, make_messages(), params, args.verbose)
         print(f"\n-- Result --")
@@ -577,18 +671,27 @@ def main() -> None:
             print(f"File not found: {ticks_path}")
             return
         print(f"Loading pre-parsed ticks from {ticks_path.name} ...")
+        cached = list(load_booktick_csv(ticks_path))
+
+        typical_price = median_mid_price(cached)
+        order_qty, max_inv = ((qty_for_notional(args.notional, typical_price))
+                              if args.notional and typical_price else (args.qty, 500))
+        if args.notional:
+            print(f"  order_qty={order_qty} (${args.notional:.0f} notional)")
+
         if args.sweep:
-            cached = list(load_booktick_csv(ticks_path))
             print(f"  Loaded {len(cached):,} ticks. Running sweep ...")
-            sweep_ticks(args.symbol, lambda: iter(cached), tick_size)
+            sweep_ticks(args.symbol, lambda: iter(cached), tick_size,
+                       order_qty=order_qty, max_inventory=max_inv)
         else:
             params = MMParams(
                 quote_offset_ticks = args.offset,
                 stale_ticks        = args.stale,
                 tick_size          = tick_size,
-                order_qty          = args.qty,
+                order_qty          = order_qty,
+                max_inventory       = max_inv,
             )
-            result = run_backtest_ticks(args.symbol, load_booktick_csv(ticks_path), params, args.verbose)
+            result = run_backtest_ticks(args.symbol, iter(cached), params, args.verbose)
             print(f"\n-- Result --")
             print(result.summary())
         return
@@ -607,11 +710,15 @@ def main() -> None:
 
     print(f"Parsing {path.name}  symbol={args.symbol} ...")
 
+    if args.notional:
+        print("  Note: --notional isn't supported on the raw --file path (price isn't known "
+              "until the order book runs) — use --ticks-file instead. Falling back to --qty.")
+
     if args.sweep:
         print(f"  Pre-loading {args.symbol} messages into memory (once) ...")
         cached = list(parse_file(path, symbol_filter=args.symbol))
         print(f"  Loaded {len(cached):,} messages. Running sweep ...")
-        sweep(args.symbol, lambda: iter(cached), tick_size)
+        sweep(args.symbol, lambda: iter(cached), tick_size, order_qty=args.qty)
         return
 
     params = MMParams(
