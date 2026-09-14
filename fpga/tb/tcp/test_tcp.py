@@ -192,8 +192,16 @@ def build_ouch_accepted(order_token: bytes) -> bytes:
 
 
 def make_order_token(order_id: int) -> bytes:
-    """14-char upper-case hex ASCII token (matches ouch_encoder.make_token)."""
-    return f'{order_id & 0xFFFFFFFFFFFFFF:014X}'.encode('ascii')
+    """14-char upper-case hex ASCII token, in wire order.
+
+    ouch_encoder.sv's make_token() writes ASCII char i at bit i*8 while the
+    shift register transmits MSB-first, so the on-wire digits are the REVERSE
+    of the hex representation: order_id=1 goes out as "10000000000000", not
+    "00000000000001". soup_session's token_to_id decodes with that same
+    reversal, so a token built forward here round-trips to a nibble-swapped
+    order_id (0xDEADBEEF came back as 0xFEEBDAED000000).
+    """
+    return f'{order_id & 0xFFFFFFFFFFFFFF:014X}'[::-1].encode('ascii')
 
 
 # ── AXI-Stream helpers ──────────────────────────────────────────────────────
@@ -221,6 +229,33 @@ async def recv_mac_frame(dut, timeout_cycles: int = 2000) -> bytes:
             if dut.mac_tx_tlast.value:
                 return bytes(data)
     raise TimeoutError(f"recv_mac_frame: no tlast after {timeout_cycles} cycles")
+
+
+def tcp_payload_of(frame: bytes) -> bytes:
+    """Extract the TCP payload, honouring the real IHL and data-offset fields
+    instead of assuming a fixed 54-byte header."""
+    ihl  = (frame[14] & 0x0F) * 4
+    off  = 14 + ihl
+    doff = ((frame[off + 12] >> 4) & 0x0F) * 4
+    return frame[off + doff:]
+
+
+async def recv_tcp_data_frame(dut, timeout_cycles: int = 3000) -> bytes:
+    """Capture the next TX frame that actually carries TCP payload.
+
+    tcp_engine sends a bare ACK to complete the three-way handshake before
+    soup_session's Login Request goes out, so a test that grabs the very next
+    frame after the handshake gets a 0-byte ACK, not the Login. Skip pure ACKs
+    (no payload) and return the first data-bearing frame.
+    """
+    deadline = timeout_cycles
+    while deadline > 0:
+        frame = await recv_mac_frame(dut, timeout_cycles=deadline)
+        payload = tcp_payload_of(frame)
+        if payload:
+            return frame
+        deadline -= 200   # rough cost of the skipped frame
+    raise TimeoutError("recv_tcp_data_frame: only pure ACKs seen")
 
 
 async def send_ouch_enter(dut, order_id: int = 1):
@@ -328,8 +363,8 @@ async def do_soup_login(dut, server_seq: int) -> int:
     Returns updated server_seq.
     """
     # Receive TCP frame carrying Login Request ('L')
-    login_frame = await recv_mac_frame(dut, timeout_cycles=500)
-    tcp_payload = login_frame[54:]  # skip 14 ETH + 20 IP + 20 TCP
+    login_frame = await recv_tcp_data_frame(dut, timeout_cycles=3000)
+    tcp_payload = tcp_payload_of(login_frame)
     assert len(tcp_payload) >= 3, f"TCP payload too short: {len(tcp_payload)} bytes"
     # SoupBinTCP: [len_hi][len_lo][type][payload]
     soup_len  = struct.unpack('!H', tcp_payload[0:2])[0]
@@ -414,8 +449,8 @@ async def test_order_submit(dut):
     cocotb.start_soon(send_ouch_enter(dut, order_id))
 
     # Capture the resulting TCP frame
-    frame = await recv_mac_frame(dut, timeout_cycles=1000)
-    tcp_payload = frame[54:]
+    frame = await recv_tcp_data_frame(dut, timeout_cycles=3000)
+    tcp_payload = tcp_payload_of(frame)
 
     # SoupBinTCP header
     soup_len  = struct.unpack('!H', tcp_payload[0:2])[0]
@@ -485,8 +520,8 @@ async def test_heartbeat(dut):
 
     # Wait for heartbeat: soup_session fires after HB_CYC cycles in ACTIVE state.
     # recv_mac_frame polls continuously, so it captures the frame as it arrives.
-    frame = await recv_mac_frame(dut, timeout_cycles=HB_CYC + 200)
-    tcp_payload = frame[54:]
+    frame = await recv_tcp_data_frame(dut, timeout_cycles=HB_CYC + 2000)
+    tcp_payload = tcp_payload_of(frame)
     soup_len  = struct.unpack('!H', tcp_payload[0:2])[0]
     soup_type = tcp_payload[2]
     assert soup_type == 0x52, \
