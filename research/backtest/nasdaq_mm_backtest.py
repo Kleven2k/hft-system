@@ -147,6 +147,7 @@ class MMResult:
     n_orders:   int   = 0
     n_fills:    int   = 0
     n_cancels:  int   = 0
+    queue_misses: int = 0   # trades printed through our price but queue hadn't cleared
 
     total_pnl:    float = 0.0
     total_rebate: float = 0.0
@@ -218,6 +219,7 @@ class MMResult:
             f"  Orders placed:     {self.n_orders:,}",
             f"  Fills:             {self.n_fills:,}  ({self.fill_rate():.1%})",
             f"  Cancels (stale):   {self.n_cancels:,}",
+            f"  Queue misses:      {self.queue_misses:,}  (traded through our price, queue not cleared)",
             f"  ---",
             f"  Realized P&L:      ${self.total_pnl:+.4f}",
             f"  Mark-to-mid (open):${self.mark_to_mid_pnl:+.4f}",
@@ -422,6 +424,15 @@ def run_backtest_ticks(
     pending        = False
     cooldown_until_tick = -1
 
+    # Queue-position tracking (FIFO price-time priority): when we join a
+    # price level we're added to the BACK of the queue, behind whatever
+    # size is already resting there. We can only fill once that much size
+    # has left the queue (via executions or cancels ahead of us) AND a
+    # further execution occurs at our price — being first to quote a level
+    # is not the same as being first in line to fill.
+    queue_ahead:        float = 0.0
+    last_size_at_price: float = 0.0   # last observed size at pending_price
+
     recent_mids: list[float] = []
     LOOKAHEAD = 10
 
@@ -457,17 +468,38 @@ def run_backtest_ticks(
                 continue
 
             tol = params.tick_size * 0.5
-            filled = False
+            trade_through = False
             if (pending_side == "BUY"
                     and tick.event in ("EXEC",)
                     and tick.last_trade is not None
                     and tick.last_trade <= pending_price + tol):
-                filled = True
+                trade_through = True
             elif (pending_side == "SELL"
                     and tick.event in ("EXEC",)
                     and tick.last_trade is not None
                     and tick.last_trade >= pending_price - tol):
-                filled = True
+                trade_through = True
+
+            # Track how much of the queue ahead of us has left, using the
+            # observed size at our exact price level (only meaningful while
+            # our price is still the best bid/ask — see run docstring above
+            # for why this only models at-touch quoting, i.e. offset=0).
+            size_at_price = (tick.bid_size if pending_side == "BUY" else tick.ask_size)
+            at_our_price  = ((pending_side == "BUY"  and tick.best_bid == pending_price) or
+                             (pending_side == "SELL" and tick.best_ask == pending_price))
+            if at_our_price:
+                if size_at_price < last_size_at_price:
+                    queue_ahead = max(0.0, queue_ahead - (last_size_at_price - size_at_price))
+                last_size_at_price = size_at_price
+            else:
+                # Price level no longer visible as best — can't observe our
+                # queue directly; assume no progress (conservative).
+                last_size_at_price = 0.0
+
+            filled = trade_through and queue_ahead <= 0
+
+            if trade_through and not filled:
+                result.queue_misses += 1
 
             if filled:
                 edge = mid - pending_price if pending_side == "BUY" else pending_price - mid
@@ -520,6 +552,11 @@ def run_backtest_ticks(
         pending_mid   = mid
         pending_ts    = tick.timestamp_ns
         result.n_orders += 1
+
+        # We join the BACK of the queue at this price -- everything already
+        # resting there (bid_size/ask_size right now) is ahead of us.
+        queue_ahead        = tick.bid_size if side == "BUY" else tick.ask_size
+        last_size_at_price = queue_ahead
 
     # Mark any residual position to the last known mid — an open position
     # that's never closed isn't free money, it's unrealized risk.
