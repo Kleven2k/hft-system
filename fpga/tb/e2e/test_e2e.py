@@ -9,7 +9,11 @@ Parameters match e2e_tb_wrapper.sv defaults:
   COOLDOWN_CYC = 10      SKEW_SHIFT   = 31 (disabled)
   FAT_FINGER_BPS = 500   MAX_BURST    = 5
 
-ITCH packet format (20 bytes per market_data_parser.sv):
+Wire format: market_data_parser.sv reads RAW MAC frames, so each message is
+a 42-byte ETH+IP+UDP header (see _eth_ip_udp_header) followed by the 20-byte
+ITCH payload below — 62 bytes total.
+
+ITCH payload format (20 bytes, at frame offset 42):
   [0]     msg_type  0x41='A' bid ADD  0x42='B' ask ADD
   [1..8]  timestamp (8 bytes, big-endian)
   [9..12] price     (4 bytes, big-endian, ticks)
@@ -17,13 +21,23 @@ ITCH packet format (20 bytes per market_data_parser.sv):
   [17..18]symbol_id (2 bytes, big-endian)
   [19]    reserved  (tlast here)
 
-OUCH new-order format (20 bytes per ouch_encoder.sv):
-  [0]     0x4F 'O'
-  [1..2]  symbol_id (big-endian)
-  [3]     side  0x42='B' / 0x53='S'
-  [4..7]  price     (big-endian)
-  [8..11] quantity  (big-endian)
-  [12..19]order_id  (big-endian)
+OUCH 4.2 Enter Order (49 bytes per ouch_encoder.sv):
+  [0]      0x4F 'O'
+  [1..14]  order_token   14-byte ASCII, order_id zero-padded left
+  [15]     buy_sell      0x42='B' / 0x53='S'
+  [16..19] shares        uint32 big-endian
+  [20..25] stock         6-byte ASCII, right-space-padded
+  [26..29] price         uint32 big-endian
+  [30..33] time_in_force uint32
+  [34..39] firm          6-byte ASCII
+  [40]     display       'Y'
+  [41]     capacity      'A'/'P'
+  [42]     iso_eligible  'N'
+  [43..46] min_qty       uint32
+  [47]     cross_type    'N'
+  [48]     customer_type ' '
+
+OUCH 4.2 Cancel Order (15 bytes): [0]=0x58 'X', [1..14]=order_token.
 """
 
 import cocotb
@@ -45,6 +59,22 @@ ORD_SELL = 0x53   # 'S' in OUCH
 # Helpers: ITCH packet sending
 # ---------------------------------------------------------------------------
 
+def _eth_ip_udp_header(dst_port=PORT_ITCH):
+    """Return the 42-byte ETH+IP+UDP header market_data_parser.sv expects.
+
+    The parser reads RAW MAC frames (not UDP payloads) and validates only
+    four fields, so everything else can be zero:
+      [12..13] EtherType == 0x0800 (IPv4)
+      [23]     IP protocol == 0x11 (UDP)
+      [36..37] UDP dest port == PORT_ITCH
+    """
+    hdr = [0x00] * 42
+    hdr[12], hdr[13] = 0x08, 0x00          # EtherType IPv4
+    hdr[23]          = 0x11                 # IP proto UDP
+    hdr[36], hdr[37] = (dst_port >> 8) & 0xFF, dst_port & 0xFF
+    return hdr
+
+
 def _itch_packet(msg_type, price, shares, symbol_id, timestamp=0):
     """Return a 20-byte ITCH message as a list of ints (big-endian)."""
     pkt = [msg_type]
@@ -57,14 +87,14 @@ def _itch_packet(msg_type, price, shares, symbol_id, timestamp=0):
 
 
 async def send_itch(dut, msg_type, price, shares=1000, symbol_id=0):
-    """Stream one ITCH message on the UDP RX AXI-Stream (rxc_clk domain).
+    """Stream one raw MAC frame (header + ITCH message) on the RX AXI-Stream.
 
     Uses RisingEdge-THEN-assign order: wait for the edge first, then set
     the signals so they are stable for the *next* edge.  This avoids the
     Icarus/cocotb VPI ordering issue where cocotb resumes before always_ff
     and a same-delta assignment would be seen by the current clock edge.
     """
-    pkt = _itch_packet(msg_type, price, shares, symbol_id)
+    pkt = _eth_ip_udp_header() + _itch_packet(msg_type, price, shares, symbol_id)
     for i, byte in enumerate(pkt):
         await RisingEdge(dut.rxc_clk)  # sync to edge first
         dut.rx_tdata.value    = byte
@@ -80,7 +110,7 @@ async def send_itch(dut, msg_type, price, shares=1000, symbol_id=0):
 # Helpers: OUCH capture
 # ---------------------------------------------------------------------------
 
-async def capture_ouch(dut, timeout=500):
+async def capture_ouch(dut, timeout=900):
     """
     Capture one complete OUCH packet from the UDP TX stream (rxc_clk domain).
     Returns the byte list on success, None on timeout.
@@ -114,17 +144,44 @@ async def capture_ouch(dut, timeout=500):
     return None
 
 
+OUCH_ENTER_LEN  = 49
+OUCH_CANCEL_LEN = 15
+
+
+def token_to_order_id(token: str) -> int:
+    """Decode ouch_encoder.sv's 14-char ASCII hex order token.
+
+    make_token() writes ASCII char i at bit position i*8, so char 0 lands in
+    the LOW byte — but the shift register transmits MSB-first, which puts the
+    LAST-written char on the wire first. The on-wire digits are therefore the
+    reverse of the hex representation: order_id=1 transmits "10000000000000",
+    not "00000000000001". (Same nibble-order trap that bit soup_session's
+    token_to_id during Phase 28 bring-up.)
+    """
+    return int(token[::-1], 16)
+
+
 def decode_ouch_new_order(pkt):
-    """Parse a 20-byte OUCH new-order packet into a dict."""
+    """Parse a 49-byte OUCH 4.2 Enter Order packet into a dict."""
     assert pkt[0] == 0x4F, f"Expected 0x4F, got 0x{pkt[0]:02X}"
+    assert len(pkt) == OUCH_ENTER_LEN, f"Expected {OUCH_ENTER_LEN} bytes, got {len(pkt)}"
+    token = bytes(pkt[1:15]).decode("ascii")
     return {
-        "msg_type":  pkt[0],
-        "symbol_id": (pkt[1] << 8) | pkt[2],
-        "side":      pkt[3],
-        "price":     (pkt[4] << 24) | (pkt[5] << 16) | (pkt[6] << 8) | pkt[7],
-        "qty":       (pkt[8] << 24) | (pkt[9] << 16) | (pkt[10] << 8) | pkt[11],
-        "order_id":  int.from_bytes(pkt[12:20], "big"),
+        "msg_type": pkt[0],
+        "token":    token,
+        "order_id": token_to_order_id(token),
+        "side":     pkt[15],
+        "qty":      int.from_bytes(bytes(pkt[16:20]), "big"),
+        "stock":    bytes(pkt[20:26]).decode("ascii").rstrip(),
+        "price":    int.from_bytes(bytes(pkt[26:30]), "big"),
     }
+
+
+def decode_ouch_cancel(pkt):
+    """Parse a 15-byte OUCH 4.2 Cancel Order packet into a dict."""
+    assert pkt[0] == 0x58, f"Expected 0x58, got 0x{pkt[0]:02X}"
+    token = bytes(pkt[1:15]).decode("ascii")
+    return {"msg_type": pkt[0], "token": token, "order_id": token_to_order_id(token)}
 
 
 # ---------------------------------------------------------------------------
@@ -174,12 +231,10 @@ async def test_bid_ask_generates_ouch_order(dut):
     await ClockCycles(dut.rxc_clk, 2)
     await send_itch(dut, 0x42, ask, shares=500, symbol_id=0)
 
-    pkt = await capture_ouch(dut, timeout=400)
+    pkt = await capture_ouch(dut, timeout=800)
     assert pkt is not None, "No OUCH packet received within timeout"
-    assert len(pkt) == 20, f"Expected 20-byte OUCH, got {len(pkt)}"
-
     order = decode_ouch_new_order(pkt)
-    assert order["symbol_id"] == 0,     f"symbol_id={order['symbol_id']}"
+    assert order["stock"]     == "AAPL", f"stock={order['stock']!r}"
     assert order["side"]      == ORD_BUY, f"Expected BUY (0x42), got 0x{order['side']:02X}"
     assert order["price"]     == bid - QUOTE_OFFSET, \
         f"price={order['price']}, expected {bid - QUOTE_OFFSET}"
@@ -204,7 +259,7 @@ async def test_wide_spread_no_order(dut):
     await ClockCycles(dut.rxc_clk, 2)
     await send_itch(dut, 0x42, 400, symbol_id=0)
 
-    pkt = await capture_ouch(dut, timeout=200)
+    pkt = await capture_ouch(dut, timeout=600)
     assert pkt is None, f"Got unexpected OUCH packet: {pkt}"
 
 
@@ -227,10 +282,10 @@ async def test_symbol_routing_slot2(dut):
     await ClockCycles(dut.rxc_clk, 2)
     await send_itch(dut, 0x42, ask, symbol_id=2)
 
-    pkt = await capture_ouch(dut, timeout=400)
+    pkt = await capture_ouch(dut, timeout=800)
     assert pkt is not None, "No OUCH packet for slot 2"
     order = decode_ouch_new_order(pkt)
-    assert order["symbol_id"] == 2, f"Expected symbol 2, got {order['symbol_id']}"
+    assert order["stock"] == "AMZN", f"Expected slot 2 = AMZN, got {order['stock']!r}"
 
 
 # ---------------------------------------------------------------------------
@@ -258,25 +313,30 @@ async def test_ouch_packet_bytes(dut):
     await ClockCycles(dut.rxc_clk, 2)
     await send_itch(dut, 0x42, ask, symbol_id=0)
 
-    pkt = await capture_ouch(dut, timeout=400)
+    pkt = await capture_ouch(dut, timeout=800)
     assert pkt is not None, "No OUCH packet received"
-    assert len(pkt) == 20
+    assert len(pkt) == OUCH_ENTER_LEN, f"Expected {OUCH_ENTER_LEN} bytes, got {len(pkt)}"
 
     expected_price = bid - QUOTE_OFFSET
-    assert pkt[0]  == 0x4F,       f"byte[0] = 0x{pkt[0]:02X}"
-    assert pkt[1]  == 0x00,       f"byte[1] (sym hi) = 0x{pkt[1]:02X}"
-    assert pkt[2]  == 0x00,       f"byte[2] (sym lo) = 0x{pkt[2]:02X}"
-    assert pkt[3]  == 0x42,       f"byte[3] (side) = 0x{pkt[3]:02X}"
-    assert pkt[4]  == (expected_price >> 24) & 0xFF
-    assert pkt[5]  == (expected_price >> 16) & 0xFF
-    assert pkt[6]  == (expected_price >>  8) & 0xFF
-    assert pkt[7]  == expected_price & 0xFF
-    assert pkt[8]  == 0x00
-    assert pkt[9]  == 0x00
-    assert pkt[10] == 0x00
-    assert pkt[11] == ORDER_QTY,  f"byte[11] (qty lo) = {pkt[11]}"
-    order_id = int.from_bytes(pkt[12:20], "big")
-    assert order_id > 0, "order_id must be non-zero"
+    assert pkt[0] == 0x4F, f"byte[0] (msg type) = 0x{pkt[0]:02X}"
+
+    # [1..14] order token — 14 ASCII hex digits, non-zero
+    token = bytes(pkt[1:15]).decode("ascii")
+    assert all(c in "0123456789ABCDEF" for c in token), f"bad token {token!r}"
+    assert int(token, 16) > 0, "order_id must be non-zero"
+
+    assert pkt[15] == ORD_BUY, f"byte[15] (side) = 0x{pkt[15]:02X}"
+    assert int.from_bytes(bytes(pkt[16:20]), "big") == ORDER_QTY, \
+        f"shares = {int.from_bytes(bytes(pkt[16:20]), 'big')}"
+    assert bytes(pkt[20:26]) == b"AAPL  ", f"stock = {bytes(pkt[20:26])!r}"
+    assert int.from_bytes(bytes(pkt[26:30]), "big") == expected_price, \
+        f"price = {int.from_bytes(bytes(pkt[26:30]), 'big')}, expected {expected_price}"
+
+    # Trailing fixed fields
+    assert pkt[40] == ord("Y"), f"byte[40] (display) = 0x{pkt[40]:02X}"
+    assert pkt[42] == ord("N"), f"byte[42] (iso_eligible) = 0x{pkt[42]:02X}"
+    assert pkt[47] == ord("N"), f"byte[47] (cross_type) = 0x{pkt[47]:02X}"
+    assert pkt[48] == ord(" "), f"byte[48] (customer_type) = 0x{pkt[48]:02X}"
 
 
 # ---------------------------------------------------------------------------
@@ -296,7 +356,7 @@ async def test_kill_switch_blocks_ouch(dut):
     await ClockCycles(dut.rxc_clk, 2)
     await send_itch(dut, 0x42, 110, symbol_id=0)
 
-    pkt = await capture_ouch(dut, timeout=200)
+    pkt = await capture_ouch(dut, timeout=600)
     assert pkt is None, f"kill_switch should block order, got: {pkt}"
 
 
@@ -323,7 +383,7 @@ async def test_order_id_increments(dut):
     await ClockCycles(dut.rxc_clk, 2)
     await send_itch(dut, 0x42, ask, symbol_id=0)
 
-    pkt1 = await capture_ouch(dut, timeout=400)
+    pkt1 = await capture_ouch(dut, timeout=800)
     assert pkt1 is not None, "First order never arrived"
     order1 = decode_ouch_new_order(pkt1)
 
@@ -342,7 +402,7 @@ async def test_order_id_increments(dut):
     # The second order fires as soon as pending clears (ACK CDC ~3 cycles) and
     # cooldown expires (COOLDOWN_CYC cycles from first-order fire, may have already
     # elapsed).  Start capture_ouch now so the OUCH bytes don't scroll past us.
-    pkt2 = await capture_ouch(dut, timeout=COOLDOWN + 80)
+    pkt2 = await capture_ouch(dut, timeout=COOLDOWN + 900)
     assert pkt2 is not None, "Second order never arrived"
     order2 = decode_ouch_new_order(pkt2)
 

@@ -174,6 +174,14 @@ module e2e_tb_wrapper
     assign order_sent = order_sent_pulse;
 
     // ---- Order engine (strategy + CDC + OUCH encoder) ------
+    // Phase 27 split the order_engine outputs: OUCH order frames leave on
+    // ouch_tx_*, while udp_tx_* carries telemetry only. This testbench wants
+    // the order stream, so it exposes ouch_tx_* as tx_*.
+    logic [7:0]  ouch_tx_tdata;
+    logic        ouch_tx_tvalid;
+    logic        ouch_tx_tready;
+    logic        ouch_tx_tlast;
+
     logic [7:0]  udp_tx_tdata;
     logic        udp_tx_tvalid;
     logic        udp_tx_tready;
@@ -210,6 +218,10 @@ module e2e_tb_wrapper
         .kill_switch      (kill_switch),
         .enc_clk          (rxc_clk),
         .enc_rst_n        (rxc_rst_n),
+        .ouch_tx_tdata    (ouch_tx_tdata),
+        .ouch_tx_tvalid   (ouch_tx_tvalid),
+        .ouch_tx_tready   (ouch_tx_tready),
+        .ouch_tx_tlast    (ouch_tx_tlast),
         .udp_tx_tdata     (udp_tx_tdata),
         .udp_tx_tvalid    (udp_tx_tvalid),
         .udp_tx_tready    (udp_tx_tready),
@@ -232,10 +244,13 @@ module e2e_tb_wrapper
         .order_sent       (order_sent_pulse)
     );
 
-    // ---- Expose UDP TX (OUCH output) -----------------------
-    assign tx_tdata        = udp_tx_tdata;
-    assign tx_tvalid       = udp_tx_tvalid;
-    assign udp_tx_tready   = tx_tready;
-    assign tx_tlast        = udp_tx_tlast;
+    // ---- Expose the OUCH order stream as tx_* ---------------
+    assign tx_tdata        = ouch_tx_tdata;
+    assign tx_tvalid       = ouch_tx_tvalid;
+    assign ouch_tx_tready  = tx_tready;
+    assign tx_tlast        = ouch_tx_tlast;
+
+    // Telemetry path is unused here, but must not backpressure the encoder.
+    assign udp_tx_tready   = 1'b1;
 
 endmodule
