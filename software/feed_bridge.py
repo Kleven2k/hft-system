@@ -232,6 +232,7 @@ class SymbolState:
         self.prev_ask     = 0             # last ask price sent (FPGA ticks)
         self.initialized  = False
         self.last_base_t  = 0.0           # monotonic time of last price_base update
+        self.n_dropped    = 0             # quotes dropped as outside the BRAM window
 
     def to_ticks(self, usd_price: float) -> int:
         return round(usd_price / self.tick)
@@ -240,15 +241,29 @@ class SymbolState:
     # Prevents spam during fast moves (e.g. BTC dropping $70 in 90 seconds).
     BASE_UPDATE_MIN_INTERVAL = 2.0
 
-    def needs_base_update(self, bid_ticks: int) -> bool:
-        """True if bid has drifted outside [price_base, price_base+drift_limit]
-        AND enough time has passed since the last update."""
+    def out_of_window(self, bid_ticks: int, ask_ticks: int) -> bool:
+        """True if either side would fall outside the order book's BRAM window.
+
+        price_idx = price - price_base must land in [0, MAX_LEVELS) for BOTH
+        sides. Checking only the bid (as this did originally) misses the case
+        where the ask escapes the window while the bid is still inside it —
+        which corrupts the book and produces garbage prices, hence garbage
+        fills. Rare on crypto, where spreads are small next to drift_limit,
+        but real: found while validating itch_replay.py on NASDAQ data, where
+        it fires on every symbol.
+        """
         if self.price_base == 0:
             return True
-        drift = bid_ticks - self.price_base
-        out_of_range = drift < 0 or drift > self.drift_limit
-        throttled    = (time.monotonic() - self.last_base_t) < self.BASE_UPDATE_MIN_INTERVAL
-        return out_of_range and not throttled
+        return (bid_ticks - self.price_base) < 0 or \
+               (ask_ticks - self.price_base) > self.drift_limit
+
+    def needs_base_update(self, bid_ticks: int, ask_ticks: int) -> bool:
+        """True if the book has drifted out of the window AND the UART
+        throttle has expired."""
+        if self.price_base == 0:
+            return True
+        throttled = (time.monotonic() - self.last_base_t) < self.BASE_UPDATE_MIN_INTERVAL
+        return self.out_of_window(bid_ticks, ask_ticks) and not throttled
 
     def reset_base(self, bid_ticks: int) -> None:
         """Set price_base = bid_ticks - BASE_OFFSET and send UART frame."""
@@ -270,8 +285,19 @@ class SymbolState:
         ask = self.to_ticks(ask_usd)
 
         # Update price_base if needed (first time or after drift)
-        if self.needs_base_update(bid):
+        if self.needs_base_update(bid, ask):
             self.reset_base(bid)
+
+        # If the quote is still outside the window (the UART throttle is
+        # holding off the rebase), drop it rather than writing out of range —
+        # a corrupted book is far worse than a briefly stale one.
+        if self.out_of_window(bid, ask):
+            self.n_dropped += 1
+            if self.n_dropped % 100 == 1:
+                log.warning(f"[{self.name.upper():>8}] quote outside price_base window "
+                            f"(bid={bid} ask={ask} base={self.price_base}) — dropped "
+                            f"{self.n_dropped} so far")
+            return
 
         # Cancel old level, add new level — only when price changed
         if bid != self.prev_bid:
