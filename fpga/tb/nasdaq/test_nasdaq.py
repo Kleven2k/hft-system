@@ -134,6 +134,42 @@ async def reset_dut(dut):
 
 
 @cocotb.test()
+async def test_telem_pnl_scaled_by_order_qty(dut):
+    """telem_pnl must credit edge x ORDER_QTY, not bare per-unit edge.
+
+    Regression guard for the Phase 31 fix: strategy.sv accumulated
+    edge-vs-mid without the quantity factor, so monitor.py and the dashboard
+    under-reported P&L by ORDER_QTY (100x). Same bug class as the two found
+    in the Python backtests.
+    """
+    cocotb.start_soon(Clock(dut.clk, CLK_NS, unit="ns").start())
+    await reset_dut(dut)
+
+    bid, ask, mid = 1000, 1010, 1005
+    _set_book(dut, bid, ask)
+    dut.mid_price_0.value = mid
+
+    order_id = None
+    for _ in range(50):
+        await RisingEdge(dut.clk)
+        if dut.order_valid.value == 1 and dut.order_cancel.value == 0:
+            order_id = int(dut.order_id.value)
+            side     = int(dut.order_side.value)
+            price    = int(dut.order_price.value)
+            break
+    assert order_id is not None, "strategy never placed an order"
+
+    await send_ack(dut, order_id, ACK_FILLED, fill_qty=ORDER_QTY)
+    await ClockCycles(dut.clk, 3)
+
+    edge_per_unit = (mid - price) if side == 0 else (price - mid)
+    pnl = dut.u_dut.telem_pnl[0].value.signed_integer
+    assert pnl == edge_per_unit * ORDER_QTY, (
+        f"telem_pnl={pnl}, expected edge({edge_per_unit}) x ORDER_QTY({ORDER_QTY}) "
+        f"= {edge_per_unit * ORDER_QTY}")
+
+
+@cocotb.test()
 async def test_nasdaq_replay(dut):
     """Replay real tick data, ack via FIFO queue-position model, report P&L."""
     cocotb.start_soon(Clock(dut.clk, CLK_NS, unit="ns").start())

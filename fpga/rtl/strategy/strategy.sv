@@ -33,11 +33,15 @@
 //   The 1.5× multiplier allows brief natural widenings without blocking,
 //   while a sudden spike (e.g. 50× normal spread) halts quoting within one cycle.
 // Phase 21B — P&L tracking:
-//   pnl[i] accumulates edge-vs-mid on every fill:
-//     BUY  fill: pnl += mid_p_r[i] − quoted_price[i]  (bought below mid → positive)
-//     SELL fill: pnl += quoted_price[i] − mid_p_r[i]  (sold above mid  → positive)
-//   Units: price ticks (1 tick = $0.0001).  Per round-trip without skew: +5 ticks.
-//   Exposed via telem_pnl for telemetry_tx.
+//   pnl[i] accumulates edge-vs-mid × ORDER_QTY on every fill:
+//     BUY  fill: pnl += (mid_p_r[i] − quoted_price[i]) × ORDER_QTY
+//     SELL fill: pnl += (quoted_price[i] − mid_p_r[i]) × ORDER_QTY
+//   Units: price ticks × shares (1 tick = $0.0001).
+//   Exposed via telem_pnl for telemetry_tx.  Display only — nothing in the
+//   trading path reads it.
+//   NOTE: the ORDER_QTY factor was missing until Phase 31, so pre-Phase-31
+//   telemetry under-reported P&L by ORDER_QTY (100×) — historical monitor.py
+//   and dashboard readings are scaled accordingly.  See fill_pnl_c().
 // Phase 18 — Input pipeline registers (timing fix):
 //   bid_p_r / ask_p_r / mid_p_r / spread_r / bid_v_r / ask_v_r
 //   register all market-data inputs one cycle.  Breaks the critical
@@ -114,6 +118,19 @@ module strategy
     // Simplify fat-finger: |diff|*10000 ≤ mid*BPS  →  |diff|*FF_FACTOR ≤ mid
     // Requires FAT_FINGER_BPS divides 10000 (e.g. 500→20, 100→100, 200→50).
     localparam int FF_FACTOR = 10000 / FAT_FINGER_BPS;
+
+    // P&L per fill = (edge in price ticks) × shares filled.  Scaling by the
+    // ORDER_QTY *parameter* rather than the runtime ack_fill_qty keeps this a
+    // constant multiply (shifts+adds, no DSP, no new critical path) — a
+    // 32×32 runtime multiply here would sit on the ACK path, which this
+    // design has very little timing margin for.  The two differ only on a
+    // partial fill, where this over-counts the unfilled remainder; pnl is
+    // telemetry/display only (see telem_pnl → telemetry_tx), never an input
+    // to any trading decision, so that approximation is acceptable.
+    function automatic logic signed [31:0] fill_pnl_c(
+        input logic [31:0] hi, input logic [31:0] lo);
+        return ($signed(hi) - $signed(lo)) * $signed(32'(ORDER_QTY));
+    endfunction
 
     (* max_fanout = 8 *) logic [LB-1:0] rr_idx;
     logic [CD_W-1:0]    cooldown      [0:N_BOOKS-1];
@@ -370,10 +387,10 @@ module strategy
                             ACK_FILLED: begin
                                 if (!pending_side[i]) begin
                                     position[i] <= position[i] + $signed(ack_fill_qty);
-                                    pnl[i] <= pnl[i] + ($signed(mid_p_r[i]) - $signed(skewed_price[i]));
+                                    pnl[i] <= pnl[i] + fill_pnl_c(mid_p_r[i], skewed_price[i]);
                                 end else begin
                                     position[i] <= position[i] - $signed(ack_fill_qty);
-                                    pnl[i] <= pnl[i] + ($signed(skewed_price[i]) - $signed(mid_p_r[i]));
+                                    pnl[i] <= pnl[i] + fill_pnl_c(skewed_price[i], mid_p_r[i]);
                                 end
                                 pending[i]     <= 1'b0;
                                 canceling[i]   <= 1'b0;
@@ -382,10 +399,10 @@ module strategy
                             ACK_PARTIAL: begin
                                 if (!pending_side[i]) begin
                                     position[i] <= position[i] + $signed(ack_fill_qty);
-                                    pnl[i] <= pnl[i] + ($signed(mid_p_r[i]) - $signed(skewed_price[i]));
+                                    pnl[i] <= pnl[i] + fill_pnl_c(mid_p_r[i], skewed_price[i]);
                                 end else begin
                                     position[i] <= position[i] - $signed(ack_fill_qty);
-                                    pnl[i] <= pnl[i] + ($signed(skewed_price[i]) - $signed(mid_p_r[i]));
+                                    pnl[i] <= pnl[i] + fill_pnl_c(skewed_price[i], mid_p_r[i]);
                                 end
                                 if (ack_fill_qty >= qty_remaining[i]) begin
                                     pending[i]       <= 1'b0;
