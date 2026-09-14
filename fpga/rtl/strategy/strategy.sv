@@ -60,6 +60,10 @@ module strategy
     parameter int SKEW_SHIFT     = 31,           // inv_skew = position>>>SKEW_SHIFT; 31=off
     parameter int QUOTE_OFFSET   = 1,            // power-on default (overridden via UART at runtime)
     parameter int STALE_MULT     = 2,            // stale_thresh = quote_offset × STALE_MULT
+    parameter int STALE_MIN_TICKS = 0,           // floor on stale_thresh — quote_offset×STALE_MULT
+                                                  // alone can't represent stale>0 at offset=0
+                                                  // (e.g. NASDAQ at-touch quoting); 0 = no floor,
+                                                  // existing crypto behavior unchanged
     parameter int FAT_FINGER_BPS = 500,          // 5 % max price deviation
     parameter int MAX_BURST         = 5,            // token bucket depth
     parameter int REFILL_PERIOD     = 12_500_000,   // 10 orders/s @ 125 MHz
@@ -318,14 +322,21 @@ module strategy
                 skewed_ask_r[i]   <= skewed_ask_c[i];
                 tok_ok_r[i]       <= (token_cnt[i] > 0);
                 cooldown_ok_r[i]  <= (cooldown[i] == '0);
-                pos_ok_buy_r[i]   <= (position[i] <= $signed(32'(0)));  // flat or short
-                pos_ok_sell_r[i]  <= (position[i] >= $signed(32'(0)));  // flat or long
+                // Prefer flattening (position on the "wrong" side of 0), but
+                // the hard MAX_POSITION cap is what actually stops inventory
+                // from running away in a persistently one-sided market —
+                // "flat or short" alone has no ceiling on how short you get.
+                pos_ok_buy_r[i]   <= (position[i] <= $signed(32'(0))) &&
+                                     (position[i] > -$signed(32'(MAX_POSITION)));
+                pos_ok_sell_r[i]  <= (position[i] >= $signed(32'(0))) &&
+                                     (position[i] <  $signed(32'(MAX_POSITION)));
                 // Skewed price stage 1: bid/ask minus inventory skew → register.
                 // quote_offset subtracted in stage 2 (via raw_bid_c in always_comb).
                 bid_minus_skew_r[i] <= $signed(bid_p_r[i]) - skew_c[i];
                 ask_minus_skew_r[i] <= $signed(ask_p_r[i]) - skew_c[i];
-                // Stale stage 0: pre-register threshold = quote_offset × STALE_MULT.
-                stale_thresh_r[i] <= quote_offset[i] * 32'(STALE_MULT);
+                // Stale stage 0: pre-register threshold = max(quote_offset × STALE_MULT, STALE_MIN_TICKS).
+                stale_thresh_r[i] <= (quote_offset[i] * 32'(STALE_MULT) > 32'(STALE_MIN_TICKS)) ?
+                                     quote_offset[i] * 32'(STALE_MULT) : 32'(STALE_MIN_TICKS);
                 // Stale stage 1: abs(quoted_price - bid/ask) → register.
                 bid_abs_diff_r[i] <= ($signed(quoted_price[i]) >= $signed(bid_p_r[i])) ?
                                       quoted_price[i] - bid_p_r[i] :
