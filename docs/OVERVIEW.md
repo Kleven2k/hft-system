@@ -1,6 +1,6 @@
 # HFT System — Project Overview
 
-> Last updated: 2026-09-13
+> Last updated: 2026-09-14
 > Hardware: Digilent Nexys Video (Xilinx Artix-7 XC7A200T), 125 MHz system clock
 > Goal: Build a real HFT system — FPGA market-making pipeline, validated strategies, path to live trading.
 
@@ -59,6 +59,7 @@ Both TCP (live) and UDP (paper) paths are active simultaneously:
 | 26 | End-to-end cocotb testbench — raw ITCH UDP in → OUCH bytes out (6 tests) | ✓ 6/6 pass, WNS=+0.018ns |
 | 27 | Full FPGA TCP: `tcp_engine` + `soup_session` — direct order submission | ✓ HW validated — Login Accepted, heartbeats confirmed |
 | 28 | Binance live trading pipeline + queue-position backtest sim | ✓ HW validated — 10 orders/sec BUY/SELL on AAVE+INJ |
+| 31 | NASDAQ strategy port: real-ITCH replay testbench + itch_replay.py | ✓ 2/2 sim tests; all 3 suites green (32/32) |
 
 **Known gaps / not yet built:**
 
@@ -120,6 +121,42 @@ with stale orders correctly cancelled and fills correctly executed against `exch
 (a touch at the quoted price fills probabilistically rather than immediately, approximating resting behind
 other orders). Realistic AVAX estimate at `fill_prob=0.2`: ~$18/day.
 
+### 1.2c Phase 31 — NASDAQ Strategy on the FPGA
+
+Runs the validated NASDAQ mean-reversion strategy on the actual RTL, against real
+ITCH data, rather than only in Python.
+
+NASDAQ has no retail direct-market-access path, so this is paper-trading by design:
+market data is historical, fills come from the queue-position model (in simulation)
+or `exchange_sim.py` (on hardware). Nothing talks to a live venue.
+
+| Piece | Purpose |
+|-------|---------|
+| `fpga/tb/nasdaq/` | Replays real AAPL BookTick rows into `strategy.sv` and acks fills using the same FIFO queue model as the Python backtest. Proves the RTL logic in simulation. |
+| `software/itch_replay.py` | Streams the same CSVs to the board as UDP market data (same wire format as `feed_bridge.py`), with `--speed` for real-time, accelerated, or max-rate replay. Drives the real bitstream end to end. |
+
+**Result:** on 100K rows of AAPL (2020-01-30) the RTL places 3,507 orders, 82 fills,
+ends flat, $351 realized — against the Python backtest's 3,811 / 88 / $404 on the same
+rows. The ~8% gap is understood: `strategy.sv` measures staleness as bid/ask drift from
+the quoted price, while the Python model measures mid drift, and those diverge when the
+spread changes shape. Documented in the testbench rather than papered over.
+
+**RTL changes:**
+- `MAX_POSITION` was declared but never used — position gating only checked
+  "flat or opposite side", with no ceiling. Now enforced.
+- Added `STALE_MIN_TICKS` so a nonzero stale threshold can coexist with
+  `quote_offset=0` (quoting at the touch, the winning NASDAQ parameter).
+  `stale_thresh` was previously locked to `quote_offset × STALE_MULT`, which is
+  identically zero at offset 0.
+- `telem_pnl` never multiplied by fill quantity, so monitor/dashboard under-reported
+  P&L by `ORDER_QTY` (100×). Third instance of this same bug class this phase.
+
+**Testbench repairs:** e2e and TCP had been sitting at 2/6 each since Phase 27/28
+changed three interfaces without the tests following. All eight failures were
+test-side; the design was fine. Notably, the tests that *were* passing in each suite
+were both negative cases, so they would have passed against a dead DUT — effective
+coverage was zero, not 33%. All suites now green (32/32).
+
 ### 1.3 Software
 
 | File | Purpose |
@@ -131,6 +168,7 @@ other orders). Realistic AVAX estimate at `fill_prob=0.2`: ~$18/day.
 | `software/set_risk.py` | UART tool: configures fat-finger limit, kill switch. |
 | `software/exchange_sim.py` | Full TCP/SoupBinTCP/OUCH 4.2 exchange simulator for validating the live order path (Phase 27/28). |
 | `software/ouch_session.py` | OUCH session client library shared across tools. |
+| `software/itch_replay.py` | Replays historical NASDAQ BookTick CSVs to the FPGA as UDP market data (Phase 31). `--speed` selects real-time, accelerated, or max-rate. |
 
 ### 1.4 Research & Backtesting
 
@@ -173,12 +211,22 @@ other orders). Realistic AVAX estimate at `fill_prob=0.2`: ~$18/day.
 ## 2. Trading Strategies
 
 ### Strategy A — CEX Crypto Market Making
-**Status: Built and simulation-tested. Not profitable at home latency.**
+**Status: Built and hardware-validated. Not profitable — closed unless venue or fee tier changes.**
 
 Post quotes on both sides of the mid-price for AVAX/LINK/AAVE/INJ on Binance.
 Earn the bid-ask spread when filled. Cancel and re-quote when price moves (stale detection).
 
-**Why it's not viable from home:** Adverse selection eats all profit. Need colocation.
+**Why it's not viable:** originally attributed to adverse selection at home latency.
+Re-examined in Phase 31 and the more basic problem is **transaction costs**. The
+backtest had assumed a 0.01% maker *rebate*; Binance spot only pays maker rebates at
+VIP9+ volume, and a retail account pays a ~0.10% maker *fee* instead. Correcting the
+sign flips the result: with realistic fees, **all four symbols lose money at every
+offset/stale combination swept**. The captured edge is consistently only 5–10% of the
+fee paid — you would need roughly 10× tighter fees or 10× wider edge to break even,
+and fill rate collapses well before edge grows that far.
+
+So the conclusion stands, but for a simpler reason than adverse selection, and one
+that colocation alone would not fix.
 
 ---
 
@@ -193,18 +241,38 @@ Trade both legs when gap exceeds ~0.51% breakeven (fees + price impact + gas).
 ---
 
 ### Strategy C — NASDAQ Stock Market Making (Mean Reversion)
-**Status: Backtested and validated. Profitable on real data. Next: FPGA implementation.**
+**Status: Backtested, corrected, and running on the FPGA in simulation. The lead candidate.**
 
 Quote passively at best bid/ask. Cancel quickly when mid moves (stale detection).
 Fade short-term price moves — profit from mean reversion.
 
-**Backtest results (real ITCH data, 3 dates, 3 symbols):**
+**Backtest results (real ITCH data, 3 dates, 3 symbols, $20k notional/order,
+FIFO queue position, $0.002/share maker rebate):**
 
-| Symbol | Avg P&L/hr | Dates Profitable | Best Params |
-|--------|-----------|-----------------|-------------|
-| AAPL | $+253/hr | 3/3 | offset=0, stale=2 |
-| MSFT | $+119/hr | 3/3 | offset=0, stale=2 |
-| AMD  | $+86/hr  | 3/3 | offset=0, stale=2 |
+| Symbol | Jan 2020 | Mar 2019 | Oct 2019 |
+|--------|----------|----------|----------|
+| AAPL | $133/hr | $184/hr | $128/hr |
+| MSFT | $83/hr* | $158/hr | $42/hr* |
+| AMD  | $134/hr* | $359/hr | $496/hr |
+
+\* includes a mark-to-mid loss on inventory left open at the close.
+
+Unlike crypto, the maker rebate here is real: US equities venues pay it to everyone,
+not just top volume tiers, which is the structural reason this survives where
+Strategy A does not.
+
+**These numbers supersede the earlier "AAPL $253/hr, MSFT $119/hr, AMD $86/hr" figures,
+which were wrong for three independent reasons** (all fixed in Phase 31):
+1. The tick CSVs were pairwise duplicates — most "per-symbol" comparisons were
+   silently testing the same stock twice under different labels.
+2. The backtest had no inventory tracking at all; every fill was booked as profit
+   with no accounting for the resulting position.
+3. Order size was a flat 100 shares regardless of price, so symbols at different
+   price levels were never compared on equal capital.
+
+Applying FIFO queue position (you join the *back* of the queue, not the front) then
+cut P&L a further 40–60% — but every symbol/date combination stayed profitable,
+which is the strongest evidence yet that the edge is real rather than an artifact.
 
 **2-year minute bar backtest (Alpaca, 2024–2026):**
 
@@ -289,15 +357,20 @@ Pulls latest CSVs from `~/hft-system/research/data/` on the Pi into the local `r
 | 26 | End-to-end testbench — raw ITCH UDP in → OUCH bytes out | 6/6 cocotb tests pass, WNS=+0.018ns |
 | 27 | Full FPGA TCP/SoupBinTCP/OUCH 4.2 order submission | HW validated — Login Accepted, heartbeats confirmed |
 | 28 | Binance live trading pipeline + queue-position backtest sim | HW validated — 10 orders/sec BUY/SELL on AAVE+INJ |
+| 31 | NASDAQ strategy on FPGA (sim) + backtest correctness overhaul | strategy.sv replays real AAPL ticks; 5 backtest bugs fixed |
 
 ### Next Up
 | # | Task | Notes |
 |---|------|-------|
-| Phase 29 | TCP retransmit timer | Low priority — LAN is reliable; needed before WAN deployment |
-| Phase 29 | ITCH 5.0 replay tool — feed historical data to FPGA over UDP | Enables real backtest loop |
-| Phase 30 | Matching engine simulator (Rust) — closes FPGA ↔ simulator loop | Full end-to-end validation |
-| Phase 31 | Configurable symbol mapping via UART | Replace hardcoded slot routing |
-| Phase 32 | Book depth alpha — order imbalance filter in strategy.sv | First real alpha signal |
+| Phase 32 | Run `itch_replay.py` against real hardware | Built and validated in loopback; not yet driven into the board |
+| Phase 32 | Rebuild the bitstream with the Phase 31 RTL changes | `MAX_POSITION`, `STALE_MIN_TICKS`, `telem_pnl` — needs a Vivado run to confirm timing still closes |
+| Phase 33 | Configurable symbol mapping via UART | Replace hardcoded slot routing; needed for NASDAQ symbols (AAPL/MSFT/AMZN/TSLA are currently `ouch_encoder` parameters) |
+| Phase 33 | TCP retransmit timer | Low priority — LAN is reliable; needed before WAN deployment |
+| Phase 34 | Book depth alpha — order imbalance filter in strategy.sv | First real alpha signal; `best_bid_qty`/`best_ask_qty` already reach the strategy unused |
+| Phase 34 | Matching engine simulator (Rust) — closes FPGA ↔ simulator loop | Full end-to-end validation |
+
+*(ITCH replay, previously listed here as Phase 29, was delivered in Phase 31 as
+`software/itch_replay.py`.)*
 
 ### Research Queue
 | Task | Status |
@@ -319,12 +392,12 @@ Pulls latest CSVs from `~/hft-system/research/data/` on the Pi into the local `r
 | Latest build WNS | +0.018 ns (Phase 26, timing met) |
 | Pipeline latency (sim) | ~8 clock cycles (~64 ns) |
 | Symbols supported (FPGA) | 4 (expandable) |
-| Testbench coverage | 6/6 strategy + 6/6 TCP + 6/6 e2e tests |
+| Testbench coverage | 32/32 — strategy 20/20, TCP 6/6, e2e 6/6, NASDAQ 2/2 |
 | ITCH parse speed (Rust) | 423M messages in ~2 min |
 | ITCH parse speed (Python) | 423M messages in ~15+ min |
 | AAPL book ticks per day | ~2M |
-| Best MM result (ITCH) | AAPL $499/hr (Jan 2020) |
-| Best MM result (avg, 3 dates) | AAPL $253/hr |
+| Best MM result (ITCH, corrected) | AMD $496/hr (Oct 2019) |
+| AAPL avg across 3 dates (corrected) | $148/hr |
 | Best bar backtest (2yr) | NVDA mean-reversion $5,444 Sharpe=11 |
 | Pi tick collection rate | ~18 ticks/sec per symbol |
 | Tailscale Pi IP | 100.70.245.92 |
