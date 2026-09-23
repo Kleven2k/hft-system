@@ -3,6 +3,14 @@
 An FPGA-based high-frequency trading platform built on the Digilent Nexys Video (Xilinx Artix-7 XC7A200T).
 Built for learning — market microstructure, FPGA engineering, and low-latency network protocols.
 
+**What makes this worth a look:** a TCP/IP stack, SoupBinTCP session layer, and OUCH 4.2
+order-entry protocol implemented entirely in SystemVerilog — not a soft-core CPU running C,
+actual RTL parsing ITCH-style market data, tracking an order book, and emitting real exchange
+protocol frames, hardware-validated end to end including a live TCP handshake against a
+software exchange simulator. Backtests are held to the same bar as the RTL: several rounds of
+this project involved finding and fixing real bugs in the strategy's own P&L accounting (see
+`docs/OVERVIEW.md` for the trail), which is arguably the more interesting engineering story.
+
 ## What's Been Built
 
 A complete market-making pipeline in hardware. Ethernet frame in → OUCH order out, no CPU in the critical path.
@@ -29,7 +37,7 @@ Both paths run simultaneously:
 | Metric | Value |
 |--------|-------|
 | FPGA clock | 125 MHz (8 ns period) |
-| Latest build WNS | +0.018 ns (timing met) |
+| Latest build WNS | +0.002 ns (timing met, margin is tight) |
 | Pipeline latency (sim) | ~8 cycles (~64 ns) |
 | Symbols supported | 4 simultaneous (AVAX/LINK/AAVE/INJ) |
 | Testbench coverage | 32/32 — strategy 20/20, TCP 6/6, e2e 6/6, NASDAQ 2/2 |
@@ -150,8 +158,8 @@ python research/backtest/nasdaq_mm_backtest.py --ticks-file aapl_ticks.csv --sym
 # 2-year Alpaca bars backtest
 python research/backtest/bars_backtest.py --sweep
 
-# SSH to Raspberry Pi data collector (Tailscale)
-ssh fredrikpi@100.70.245.92
+# SSH to Raspberry Pi data collector (Tailscale; set $PI_HOST=user@tailscale-ip)
+ssh $PI_HOST
 bash research/collectors/sync_from_pi.sh    # Pull tick CSVs to laptop
 ```
 

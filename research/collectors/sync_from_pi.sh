@@ -4,7 +4,8 @@
 # since the collector still has it open for writing).
 set -euo pipefail
 
-PI_HOST="fredrikpi@100.70.245.92"
+# Set PI_HOST in your shell/.env, e.g. PI_HOST="user@100.x.x.x" (Tailscale IP)
+: "${PI_HOST:?Set PI_HOST=user@host before running this script}"
 PI_DATA_DIR="~/hft-system/research/data"
 LOCAL_DATA_DIR="$(dirname "$0")/../data/"
 TODAY="$(date +%Y%m%d)"

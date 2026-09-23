@@ -306,25 +306,25 @@ Target European equities via Oslo Børs (Euronext group).
 - Running `hft-collector` systemd service 24/7
 - Collecting Binance WebSocket ticks: AVAX, LINK, AAVE, INJ (~18 ticks/sec each)
 - ~90 MB/day, 6 GB free on SD card
-- Accessible via Tailscale VPN (`100.70.245.92`) from anywhere
-- SSH: `fredrikpi@100.70.245.92` (passwordless via SSH key)
+- Accessible via Tailscale VPN from anywhere
+- SSH: passwordless via SSH key (host/user kept out of version control — see `.env`)
 
-**Checking Pi services/processes:**
+**Checking Pi services/processes** (set `PI_HOST=user@tailscale-ip` in your shell):
 ```bash
 # Check the tick collector
-ssh fredrikpi@100.70.245.92 "sudo systemctl status hft-collector"
+ssh $PI_HOST "sudo systemctl status hft-collector"
 
 # Check the DEX monitor
-ssh fredrikpi@100.70.245.92 "sudo systemctl status hft-dex-monitor"
+ssh $PI_HOST "sudo systemctl status hft-dex-monitor"
 
 # List all hft-* services at once
-ssh fredrikpi@100.70.245.92 "systemctl list-units 'hft-*' --all"
+ssh $PI_HOST "systemctl list-units 'hft-*' --all"
 
 # Live logs (Ctrl+C to stop)
-ssh fredrikpi@100.70.245.92 "journalctl -u hft-collector -f"
+ssh $PI_HOST "journalctl -u hft-collector -f"
 
 # Raw process list
-ssh fredrikpi@100.70.245.92 "ps aux | grep python"
+ssh $PI_HOST "ps aux | grep python"
 ```
 
 **Syncing collected data to laptop:**
@@ -389,7 +389,7 @@ Pulls latest CSVs from `~/hft-system/research/data/` on the Pi into the local `r
 | Metric | Value |
 |--------|-------|
 | FPGA clock | 125 MHz (8 ns period) |
-| Latest build WNS | +0.018 ns (Phase 26, timing met) |
+| Latest build WNS | +0.002 ns (Phase 31, timing met — margin is now very tight) |
 | Pipeline latency (sim) | ~8 clock cycles (~64 ns) |
 | Symbols supported (FPGA) | 4 (expandable) |
 | Testbench coverage | 32/32 — strategy 20/20, TCP 6/6, e2e 6/6, NASDAQ 2/2 |
@@ -400,7 +400,6 @@ Pulls latest CSVs from `~/hft-system/research/data/` on the Pi into the local `r
 | AAPL avg across 3 dates (corrected) | $148/hr |
 | Best bar backtest (2yr) | NVDA mean-reversion $5,444 Sharpe=11 |
 | Pi tick collection rate | ~18 ticks/sec per symbol |
-| Tailscale Pi IP | 100.70.245.92 |
 
 ---
 
@@ -454,5 +453,5 @@ python research/collectors/alpaca_history.py --days 730 --timeframe 1Min
 python research/nasdaq/show_scan.py research\data\nasdaq\scan.csv
 
 # SSH to Raspberry Pi (from anywhere via Tailscale)
-ssh fredrikpi@100.70.245.92
+ssh $PI_HOST
 ```

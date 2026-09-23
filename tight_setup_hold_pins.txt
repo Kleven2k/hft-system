@@ -1,6 +1,11 @@
-+====================+===================+=========================================================================================================+
-| Launch Setup Clock | Launch Hold Clock | Pin                                                                                                     |
-+====================+===================+=========================================================================================================+
-| clk_unbuf          | clk_unbuf         | order_engine_inst/u_strategy/qty_remaining_reg[2][31]/D                                                 |
-| clk_unbuf          | clk_unbuf         | eth_stack_inst/udp_stack_inst/ip_complete_inst/ip_inst/ip_eth_rx_inst/FSM_sequential_state_reg_reg[0]/D |
-+--------------------+-------------------+---------------------------------------------------------------------------------------------------------+
++====================+===================+================================================================================================+
+| Launch Setup Clock | Launch Hold Clock | Pin                                                                                            |
++====================+===================+================================================================================================+
+| clk_unbuf          | clk_unbuf         | eth_stack_inst/eth_rx_inst/m_eth_payload_axis_tdata_reg_reg[2]/D                               |
+| clk_unbuf          | clk_unbuf         | eth_stack_inst/udp_stack_inst/ip_complete_inst/ip_inst/ip_eth_rx_inst/m_ip_hdr_valid_reg_reg/D |
+| clk_unbuf          | clk_unbuf         | gen_order_books[0].ob_inst/ask_valid_reg/D                                                     |
+| clk_unbuf          | clk_unbuf         | order_engine_inst/u_strategy/pnl_reg[3][30]/D                                                  |
+| clk_unbuf          | clk_unbuf         | eth_stack_inst/eth_rx_inst/m_eth_payload_axis_tdata_reg_reg[1]/D                               |
+| clk_unbuf          | clk_unbuf         | order_engine_inst/u_strategy/pnl_reg[2][30]/D                                                  |
+| clk_unbuf          | clk_unbuf         | gen_order_books[0].ob_inst/ask_valid_reg_rep/D                                                 |
++--------------------+-------------------+------------------------------------------------------------------------------------------------+
