@@ -15,17 +15,29 @@ this project involved finding and fixing real bugs in the strategy's own P&L acc
 
 A complete market-making pipeline in hardware. Ethernet frame in → OUCH order out, no CPU in the critical path.
 
-```
-Ethernet RX
-    └─► market_data_parser.sv   — Parses ITCH-like binary feed (UDP)
-            └─► symbol_router.sv         — Routes to slot 0–3
-                    └─► order_book.sv            — Best bid/ask tracking per slot
-                            └─► strategy.sv              — Spread/skew/EMA/stale logic
-                                    └─► order_engine.sv          — OMS: order table, risk, watchdog
-                                            ├─► ouch_encoder.sv
-                                            │       └─► soup_session.sv      — SoupBinTCP login/heartbeat/framing
-                                            │               └─► tcp_engine.sv — ARP + TCP handshake + TX/RX
-                                            └─► eth_stack_wrapper.sv  — UDP telemetry + paper-mode ACK path
+```mermaid
+flowchart TD
+    A["Ethernet RX"] --> B["market_data_parser.sv
+    Parses ITCH-like binary feed (UDP)"]
+    B --> C["symbol_router.sv
+    Routes to slot 0–3"]
+    C --> D["order_book.sv
+    Best bid/ask tracking per slot"]
+    D --> E["strategy.sv
+    Spread / skew / EMA / stale logic"]
+    E --> F["order_engine.sv
+    OMS: order table, risk, watchdog"]
+    F --> G["ouch_encoder.sv
+    Serializes OUCH 4.2 order frames"]
+    G --> H["soup_session.sv
+    SoupBinTCP login / heartbeat / framing"]
+    H --> I["tcp_engine.sv
+    ARP + TCP handshake + TX/RX"]
+    F --> J["eth_stack_wrapper.sv
+    UDP telemetry + paper-mode ACK path"]
+
+    I -.->|live: exec reports| F
+    J -.->|paper: ACK| F
 ```
 
 Both paths run simultaneously:
